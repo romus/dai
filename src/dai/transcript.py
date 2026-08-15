@@ -71,18 +71,21 @@ class Transcript:
             pid=os.getpid(),
         )
 
-    def snapshots(self, label: str, report: SnapshotReport) -> None:
+    def snapshots(self, report: SnapshotReport) -> None:
         if not report.taken and not report.skipped:
             return
         self.event(
             "snapshot",
-            label=label,
-            refs=[{"repo": str(s.repo), "ref": s.ref, "commit": s.commit} for s in report.taken],
+            label=report.label,
+            commits=[
+                {"repo": str(s.repo), "branch": s.branch, "commit": s.commit}
+                for s in report.taken
+            ],
             skipped=report.skipped,
         )
 
     def finish(self, result: DebateResult, *, task: str, cwd: Path,
-               solver: str, critic: str) -> Path | None:
+               solver: str, critic: str, branch: str = "") -> Path | None:
         self.event(
             "finish",
             outcome=result.outcome.value,
@@ -96,7 +99,8 @@ class Transcript:
         if not self.enabled:
             return None
         report = render_report(
-            result, run_id=self.run_id, task=task, cwd=cwd, solver=solver, critic=critic
+            result, run_id=self.run_id, task=task, cwd=cwd, solver=solver,
+            critic=critic, branch=branch,
         )
         target = self.dir / "report.md"
         try:
@@ -160,7 +164,8 @@ _HEADLINE = {
 
 
 def render_report(
-    result: DebateResult, *, run_id: str, task: str, cwd: Path, solver: str, critic: str
+    result: DebateResult, *, run_id: str, task: str, cwd: Path, solver: str,
+    critic: str, branch: str = "",
 ) -> str:
     spend = result.spend
     money = f"${spend.usd:.2f}"
@@ -190,22 +195,26 @@ def render_report(
                 lines.append(f"  - evidence: {issue.evidence}")
         lines.append("")
 
-    # Name refs that actually exist: a single-round run has no r2 to diff against.
-    first = "r1"
-    last = f"r{len(result.rounds)}" if len(result.rounds) > 1 else "final"
-
-    lines += [
-        "## Recovering a round",
-        "",
-        "Each round was snapshotted without touching your branch, HEAD, index or",
-        "working tree:",
-        "",
-        "```",
-        f"git diff refs/dai/{run_id}/{first} refs/dai/{run_id}/{last}",
-        f"git restore --source refs/dai/{run_id}/{first} -- .",
-        "```",
-        "",
-    ]
+    # No branch means nothing was committed — a dry run, or snapshots switched
+    # off. Naming one that does not exist would be worse than saying nothing.
+    if branch:
+        lines += [
+            "## The work, round by round",
+            "",
+            f"Each round was committed to `{branch}`, rooted at the HEAD you started",
+            "from. Your branch, HEAD, index and working tree were never touched.",
+            "",
+            "```",
+            f"git log --oneline HEAD..{branch}   # the rounds",
+            f"git diff HEAD {branch}             # everything they changed",
+            f"git reset --hard {branch}          # keep it",
+            "```",
+            "",
+            "The working tree already holds that last commit, so the reset moves your",
+            "branch onto the work and rewrites no file. To throw it all away instead,",
+            f"delete the branch: `git branch -D {branch}`.",
+            "",
+        ]
     return "\n".join(lines)
 
 

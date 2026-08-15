@@ -148,6 +148,19 @@ class Debate:
 
         return self._finish(Outcome.ABORTED, reason)
 
+    @property
+    def last_verdict(self) -> str:
+        """How the referee called the most recently judged round, in one line.
+
+        For whoever is recording the run — a commit message wants to say what
+        the round it holds actually settled. Empty before the first assessment.
+        """
+
+        for rnd in reversed(self.rounds):
+            if rnd.assessment is not None:
+                return f"round {rnd.number}: {rnd.assessment.reason}"
+        return ""
+
     # --- main loop --------------------------------------------------------
 
     async def run(self) -> DebateResult:

@@ -29,6 +29,7 @@ class EngineConfig:
 class SnapshotConfig:
     enabled: bool = True
     scan_depth: int = 3
+    branch_prefix: str = "dai/"
     ignore: list[str] = field(
         default_factory=lambda: ["node_modules", ".venv", "venv", "target", "dist", "build"]
     )
@@ -122,11 +123,14 @@ stop_on_minor_only = true  # stop once nothing worse than `minor` is left open
 policy = "critic"
 
 [snapshot]
-# Before each round, dai records the tree of every git repo it finds, under
-# refs/dai/<run-id>/r<N>. Your branch, HEAD, index and working tree are never
-# touched. Directories without git are skipped.
+# Every git repo dai finds gets one commit per round, on a branch of dai's own:
+# dai/<run-id>, rooted at the HEAD you started from. The branch you are on,
+# HEAD, the index and the working tree are never touched, and `git commit` is
+# never run, so your pre-commit hooks stay out of it. Directories without git
+# are skipped; rounds that changed nothing leave no commit behind.
 enabled = true
 scan_depth = 3
+branch_prefix = "dai/"
 ignore = ["node_modules", ".venv", "venv", "target", "dist", "build"]
 
 [engines.claude]
@@ -226,6 +230,7 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
         snapshot=SnapshotConfig(
             enabled=bool(snap.get("enabled", True)),
             scan_depth=int(snap.get("scan_depth", 3)),
+            branch_prefix=str(snap.get("branch_prefix", "dai/")),
             ignore=_strings(snap.get("ignore"), SnapshotConfig().ignore),
         ),
         engines=engines,

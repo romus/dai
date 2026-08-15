@@ -173,7 +173,7 @@ class ConfirmQuitScreen(ModalScreen[bool]):
             yield Label("Kill the agents?", classes="title")
             yield Static(
                 "The turn in flight is killed mid-stride — the working tree may "
-                "be left half-modified. Finished rounds stay parked at refs/dai/."
+                "be left half-modified. Finished rounds are already committed."
             )
             with Horizontal():
                 yield Button("Kill and quit", variant="error", id="kill")
@@ -341,8 +341,8 @@ class DaiApp(FollowsTerminal, App):
         verdicts.note(self.debate.task, style="text", label="TASK")
         if self.snapshotter.active:
             verdicts.note(
-                f"snapshotting {len(self.snapshotter.repos)} repo(s) → "
-                f"refs/dai/{self.transcript.run_id}/"
+                f"committing {len(self.snapshotter.repos)} repo(s) round by round "
+                f"→ {self.snapshotter.branch}"
             )
 
         self.debate.on_event = self._on_debate_event
@@ -374,8 +374,11 @@ class DaiApp(FollowsTerminal, App):
             return
 
         if self.snapshotter.active:
-            report = await asyncio.to_thread(self.snapshotter.capture, "final")
-            self.transcript.snapshots("final", report)
+            report = await asyncio.to_thread(
+                self.snapshotter.capture_final,
+                f"{self.result.outcome.value}: {self.result.reason}",
+            )
+            self.transcript.snapshots(report)
 
         path = self.transcript.finish(
             self.result,
@@ -383,6 +386,7 @@ class DaiApp(FollowsTerminal, App):
             cwd=self.cwd,
             solver=self.debate.solver.name,
             critic=self.debate.critic.name,
+            branch=self.snapshotter.report_branch,
         )
         self._announce(self.result, path)
 
@@ -455,11 +459,13 @@ class DaiApp(FollowsTerminal, App):
     async def _on_round_start(self, number: int) -> None:
         if not self.snapshotter.active:
             return
-        report = await asyncio.to_thread(self.snapshotter.capture, f"r{number}")
-        self.transcript.snapshots(f"r{number}", report)
+        report = await asyncio.to_thread(
+            self.snapshotter.capture_gate, number, self.debate.last_verdict
+        )
+        self.transcript.snapshots(report)
         for note in report.skipped:
             self.query_one(VerdictLog).note(
-                f"! snapshot skipped — {note}", style="plain-warning"
+                f"! commit skipped — {note}", style="plain-warning"
             )
 
     async def _on_deadlock(self, pending: DebateResult) -> str:
@@ -518,17 +524,20 @@ class DaiApp(FollowsTerminal, App):
         if self.result is None:
             self.result = self.debate.abort_result("killed by the user")
         try:
-            # A deliberate kill still deserves a "final" snapshot: it captures
-            # the half-modified tree the confirmation warned about.
+            # A deliberate kill still deserves a final commit: it captures the
+            # half-modified tree the confirmation warned about.
             if self.snapshotter.active:
-                report = await asyncio.to_thread(self.snapshotter.capture, "final")
-                self.transcript.snapshots("final", report)
+                report = await asyncio.to_thread(
+                    self.snapshotter.capture_final, "killed by the user"
+                )
+                self.transcript.snapshots(report)
             self.transcript.finish(
                 self.result,
                 task=self.debate.task,
                 cwd=self.cwd,
                 solver=self.debate.solver.name,
                 critic=self.debate.critic.name,
+                branch=self.snapshotter.report_branch,
             )
         except Exception:
             pass  # recording must never stand between the user and the exit
