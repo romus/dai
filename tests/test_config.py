@@ -32,6 +32,7 @@ def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tm
     assert cfg.stop_on_minor_only is True
     assert cfg.snapshot.enabled is True
     assert cfg.snapshot.branch_prefix == "dai/"
+    assert cfg.snapshot.merge_on_consensus is False
     assert cfg.engine("claude").critic_args == ["--permission-mode", "plan"]
     assert cfg.engine("codex").critic_args == ["--sandbox", "read-only"]
 
@@ -60,6 +61,13 @@ def test_the_run_branch_can_be_named_something_else():
 
     assert cfg.snapshot.branch_prefix == "agents/"
     assert cfg.snapshot.scan_depth == 3  # untouched keys keep their defaults
+
+
+def test_merging_the_work_back_can_be_switched_on_in_the_config():
+    cfg = from_dict({"snapshot": {"merge_on_consensus": True}})
+
+    assert cfg.snapshot.merge_on_consensus is True
+    assert cfg.snapshot.enabled is True  # untouched keys keep their defaults
 
 
 def test_engine_overrides_merge_rather_than_replace():

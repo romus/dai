@@ -30,6 +30,7 @@ class SnapshotConfig:
     enabled: bool = True
     scan_depth: int = 3
     branch_prefix: str = "dai/"
+    merge_on_consensus: bool = False
     ignore: list[str] = field(
         default_factory=lambda: ["node_modules", ".venv", "venv", "target", "dist", "build"]
     )
@@ -124,13 +125,24 @@ policy = "critic"
 
 [snapshot]
 # Every git repo dai finds gets one commit per round, on a branch of dai's own:
-# dai/<run-id>, rooted at the HEAD you started from. The branch you are on,
-# HEAD, the index and the working tree are never touched, and `git commit` is
-# never run, so your pre-commit hooks stay out of it. Directories without git
-# are skipped; rounds that changed nothing leave no commit behind.
+# dai/<run-id>, rooted at the HEAD you started from. Capturing a round never
+# touches the branch you are on, HEAD, the index or the working tree, and never
+# runs `git commit`, so your pre-commit hooks stay out of it. Directories
+# without git are skipped; rounds that changed nothing leave no commit behind.
+# `dai --snapshots` lists which repo ended up with what.
 enabled = true
 scan_depth = 3
 branch_prefix = "dai/"
+
+# The one setting that moves you, which is why it is off. On consensus — and
+# only consensus — fast-forward the branch you were on onto the run's work, by
+# running `git reset --hard dai/<run-id>` in every repo that got commits. No
+# file is rewritten (the working tree already holds that last commit) and no
+# hook fires, but your branch moves and your index is reset, so anything you
+# had staged stops being staged. Any repo whose branch or working tree moved
+# since the run finished is refused, with the reason printed.
+merge_on_consensus = false
+
 ignore = ["node_modules", ".venv", "venv", "target", "dist", "build"]
 
 [engines.claude]
@@ -231,6 +243,7 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
             enabled=bool(snap.get("enabled", True)),
             scan_depth=int(snap.get("scan_depth", 3)),
             branch_prefix=str(snap.get("branch_prefix", "dai/")),
+            merge_on_consensus=bool(snap.get("merge_on_consensus", False)),
             ignore=_strings(snap.get("ignore"), SnapshotConfig().ignore),
         ),
         engines=engines,

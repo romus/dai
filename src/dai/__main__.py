@@ -10,12 +10,19 @@ from pathlib import Path
 
 from dai import __version__, config as config_module
 from dai.budget import Budget, Limits
-from dai.config import Config
+from dai.config import Config, SnapshotConfig
 from dai.consensus import Referee
 from dai.engines import Engine, build_engine
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
-from dai.snapshot import Snapshotter, ignore_locally, toplevel
+from dai.snapshot import (
+    Snapshotter,
+    describe,
+    find_repos,
+    ignore_locally,
+    list_branches,
+    toplevel,
+)
 from dai.transcript import Transcript, list_runs, new_run_id
 
 EXIT_OK = 0
@@ -54,10 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-snapshot", action="store_true", help="do not commit each round to a branch"
     )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="on agreement, move your branch onto the run's (git reset --hard)",
+    )
     parser.add_argument("--config", type=Path, help="use a specific config file")
     parser.add_argument("-C", "--cwd", type=Path, help="work in this directory")
     parser.add_argument("--init", action="store_true", help="write the default config and exit")
     parser.add_argument("--runs", action="store_true", help="list past runs here")
+    parser.add_argument(
+        "--snapshots", action="store_true", help="list the branches dai committed to"
+    )
     parser.add_argument("--show", metavar="RUN_ID", help="print a past run's report")
     parser.add_argument("--version", action="version", version=f"dai {__version__}")
     return parser
@@ -74,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
         return _list_runs(cwd)
     if args.show:
         return _show_run(cwd, args.show)
+    if args.snapshots:
+        # Deliberately not through _apply_overrides: --no-snapshot switches off
+        # committing, not the ability to look at what was already committed.
+        return _list_snapshots(cwd, config_module.load(args.config).snapshot)
 
     if not cwd.is_dir():
         print(f"dai: {cwd} is not a directory", file=sys.stderr)
@@ -190,9 +209,13 @@ def _apply_overrides(cfg: Config, args) -> Config:
         cfg.language = args.lang
     if getattr(args, "theme", None):
         cfg.theme = args.theme
-    # Nothing is written during a dry run, so there is nothing to commit.
+    if getattr(args, "merge", False):
+        cfg.snapshot.merge_on_consensus = True
+    # Nothing is written during a dry run, so there is nothing to commit — and
+    # so nothing to merge either, whatever the config or `--merge` asked for.
     if getattr(args, "no_snapshot", False) or getattr(args, "dry_run", False):
         cfg.snapshot.enabled = False
+        cfg.snapshot.merge_on_consensus = False
 
     limits = cfg.limits
     cfg.limits = Limits(
@@ -241,6 +264,50 @@ def _list_runs(cwd: Path) -> int:
     return EXIT_OK
 
 
+def _list_snapshots(cwd: Path, settings: SnapshotConfig) -> int:
+    """Every branch dai has left here, grouped by the repository holding it."""
+
+    # Its own guard: this runs before main()'s, so that `--init -C /nowhere`
+    # keeps working.
+    if not cwd.is_dir():
+        print(f"dai: {cwd} is not a directory", file=sys.stderr)
+        return EXIT_ERROR
+
+    repos = find_repos(cwd, depth=settings.scan_depth, ignore=settings.ignore)
+    if not repos:
+        print(f"no git repositories under {cwd}")
+        return EXIT_OK
+
+    found = list_branches(cwd, settings)
+    if not found:
+        # Two different diagnoses, and the difference is the whole point of the
+        # command: "there is no git here" is not "the run committed nothing".
+        print(f"no dai branches in {len(repos)} repo(s) under {cwd}")
+        return EXIT_OK
+
+    # Repositories that hold something first. The empty branches are worth
+    # naming — they are what an untouched repo looks like, which is not the
+    # same as a missing one — but they must not bury the one you came for.
+    empty = []
+    for repo in repos:
+        here = [info for info in found if info.repo == repo]
+        if not here:
+            continue
+        if not any(info.commits for info in here):
+            empty.append(repo.name)
+            continue
+        print(_relative(str(repo), cwd) if repo != cwd else ".")
+        for info in here:
+            plural = "" if info.commits == 1 else "s"
+            counted = f"{info.commits} commit{plural}"
+            print(f"  {info.branch}  {_colour(counted, DIM)}  {info.when}  {info.subject}")
+
+    if empty:
+        print(_colour(f"nothing committed in: {', '.join(empty)}", DIM))
+    print(_colour("read one: git -C <repo> log --oneline <branch>", DIM))
+    return EXIT_OK
+
+
 def _show_run(cwd: Path, run_id: str) -> int:
     report = cwd / ".dai" / "runs" / run_id / "report.md"
     if not report.is_file():
@@ -282,13 +349,15 @@ async def _run_headless(
     )
     print(_colour(f"task: {debate.task}", DIM))
     if snapshotter.active:
-        print(
-            _colour(
-                f"committing {len(snapshotter.repos)} repo(s) round by round "
-                f"to {snapshotter.branch}",
-                DIM,
-            )
+        banner = (
+            f"committing {len(snapshotter.repos)} repo(s) round by round "
+            f"to {snapshotter.branch}"
         )
+        # Something that will move the user's branch has to be said before the
+        # run, not discovered after it.
+        if snapshotter.settings.merge_on_consensus:
+            banner += " · your branch moves onto it if they agree"
+        print(_colour(banner, DIM))
     print()
 
     transcript.start(
@@ -346,6 +415,8 @@ async def _run_headless(
             snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
         )
         transcript.snapshots(final)
+        if snapshotter.settings.merge_on_consensus and result.agreed:
+            await asyncio.to_thread(snapshotter.merge)
 
     report_path = transcript.finish(
         result,
@@ -353,9 +424,11 @@ async def _run_headless(
         cwd=cwd,
         solver=debate.solver.name,
         critic=debate.critic.name,
-        branch=snapshotter.report_branch,
+        repos=snapshotter.summary(),
     )
     _report(result)
+    for line in describe(snapshotter.summary(), cwd):
+        print(_colour(line, DIM) if line.startswith(" ") else line)
     if report_path is not None:
         print(_colour(f"transcript: {report_path}", DIM))
     return result
