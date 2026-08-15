@@ -351,8 +351,9 @@ async def test_the_kill_switch_never_merges_the_work(tmp_path):
 
     repo = make_repo(tmp_path)
     ignore_locally(repo, ".dai/")  # as the real entry point does, before anything writes
+    snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge=True))
+    snapshotter.observe()  # the round-1 gate, before any agent moves
     (repo / "a.txt").write_text("the agents got this far\n")
-    snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge_on_consensus=True))
     solver = Hanging("solver-engine", [])
     app, _ = make_app_from(
         repo, solver, Scripted("critic-engine", [approve()]), snapshotter=snapshotter
@@ -369,7 +370,8 @@ async def test_the_kill_switch_never_merges_the_work(tmp_path):
     captured = git_out("rev-parse", "dai/run1", cwd=repo)
 
     assert captured and captured != before, "the kill should still have committed"
-    assert git_out("rev-parse", "HEAD", cwd=repo) == before, "but must not have merged"
+    assert git_out("rev-parse", "main", cwd=repo) == before, "but must not have merged"
+    assert git_out("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
     assert [entry.commits for entry in snapshotter.summary()] == [1]
     assert not any(entry.merged for entry in snapshotter.summary())
 

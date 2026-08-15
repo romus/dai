@@ -62,9 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-snapshot", action="store_true", help="do not commit each round to a branch"
     )
     parser.add_argument(
-        "--merge",
-        action="store_true",
-        help="on agreement, move your branch onto the run's (git reset --hard)",
+        "--branch-from",
+        metavar="BRANCH",
+        help='what the run branches from and merges back into; "current" or a name',
+    )
+    parser.add_argument(
+        "--merge", action="store_true", help="on agreement, merge back (the default)"
+    )
+    parser.add_argument(
+        "--no-merge", action="store_true", help="leave the work on the run's branch"
     )
     parser.add_argument("--config", type=Path, help="use a specific config file")
     parser.add_argument("-C", "--cwd", type=Path, help="work in this directory")
@@ -83,7 +89,10 @@ def main(argv: list[str] | None = None) -> int:
     cwd = (args.cwd or Path.cwd()).resolve()
 
     if args.init:
-        print(f"config: {config_module.ensure_config(args.config)}")
+        path, added = config_module.ensure_config(args.config)
+        print(f"config: {path}")
+        for name in added:
+            print(f"  added {name}")
         return EXIT_OK
     if args.runs:
         return _list_runs(cwd)
@@ -168,7 +177,11 @@ def main(argv: list[str] | None = None) -> int:
         if result is None:
             print("dai: the run ended before reaching a verdict", file=sys.stderr)
             return EXIT_ERROR
+        # Printed out here, not inside the app: Textual draws on the alternate
+        # screen and wipes it on exit, so anything said in the TUI is gone the
+        # moment the user quits. The scrollback is the only durable surface.
         _report(result)
+        _where(snapshotter, cwd, app.report_path)
 
     return EXIT_OK if result.agreed else EXIT_DISAGREED
 
@@ -209,13 +222,17 @@ def _apply_overrides(cfg: Config, args) -> Config:
         cfg.language = args.lang
     if getattr(args, "theme", None):
         cfg.theme = args.theme
+    if getattr(args, "branch_from", None):
+        cfg.snapshot.branch_from = args.branch_from
     if getattr(args, "merge", False):
-        cfg.snapshot.merge_on_consensus = True
+        cfg.snapshot.merge = True
+    if getattr(args, "no_merge", False):
+        cfg.snapshot.merge = False
     # Nothing is written during a dry run, so there is nothing to commit — and
     # so nothing to merge either, whatever the config or `--merge` asked for.
     if getattr(args, "no_snapshot", False) or getattr(args, "dry_run", False):
         cfg.snapshot.enabled = False
-        cfg.snapshot.merge_on_consensus = False
+        cfg.snapshot.merge = False
 
     limits = cfg.limits
     cfg.limits = Limits(
@@ -349,14 +366,14 @@ async def _run_headless(
     )
     print(_colour(f"task: {debate.task}", DIM))
     if snapshotter.active:
+        # Moving the repo onto a branch has to be said before the run, not
+        # discovered after it.
         banner = (
-            f"committing {len(snapshotter.repos)} repo(s) round by round "
-            f"to {snapshotter.branch}"
+            f"any of {len(snapshotter.repos)} repo(s) that changes moves onto "
+            f"{snapshotter.branch}, a commit per round"
         )
-        # Something that will move the user's branch has to be said before the
-        # run, not discovered after it.
-        if snapshotter.settings.merge_on_consensus:
-            banner += " · your branch moves onto it if they agree"
+        if snapshotter.settings.merge:
+            banner += " · merged back if they agree"
         print(_colour(banner, DIM))
     print()
 
@@ -415,7 +432,7 @@ async def _run_headless(
             snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
         )
         transcript.snapshots(final)
-        if snapshotter.settings.merge_on_consensus and result.agreed:
+        if snapshotter.settings.merge and result.agreed:
             await asyncio.to_thread(snapshotter.merge)
 
     report_path = transcript.finish(
@@ -427,11 +444,17 @@ async def _run_headless(
         repos=snapshotter.summary(),
     )
     _report(result)
+    _where(snapshotter, cwd, report_path)
+    return result
+
+
+def _where(snapshotter: Snapshotter, cwd: Path, report_path: Path | None) -> None:
+    """Where the work ended up — the last thing said, in both frontends."""
+
     for line in describe(snapshotter.summary(), cwd):
         print(_colour(line, DIM) if line.startswith(" ") else line)
     if report_path is not None:
         print(_colour(f"transcript: {report_path}", DIM))
-    return result
 
 
 def _report(result: DebateResult) -> None:

@@ -169,7 +169,7 @@ def report(repos, cwd=Path("/ws")) -> str:
                          solver="claude", critic="codex", repos=repos)
 
 
-def test_report_explains_what_to_do_with_the_branch():
+def test_report_explains_where_the_work_is(tmp_path):
     """Named against the repository holding it: the branch alone is not an address.
 
     The directory a run starts in need not be a repository — it can hold
@@ -177,20 +177,21 @@ def test_report_explains_what_to_do_with_the_branch():
     answers "not a git repository", which reads like nothing was committed.
     """
 
-    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1",
-                              base="a" * 40, commits=3)])
+    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
+                              base_branch="main", commits=3, switched=True)])
 
     assert "api" in body
+    assert "You are on `dai/run1`" in body
     assert "git -C api log --oneline aaaaaaaaaaaa..dai/run1" in body
     assert "git -C api diff aaaaaaaaaaaa dai/run1" in body
-    assert "git -C api reset --hard dai/run1" in body
-    assert "git branch -D" in body
+    assert "git -C api checkout main" in body   # how to get back
     assert "HEAD.." not in body
 
 
 def test_commands_for_the_directory_you_are_in_carry_no_dash_c():
-    body = report([RepoResult(repo=Path("/ws"), branch="dai/run1",
-                              base="a" * 40, commits=1)], cwd=Path("/ws"))
+    body = report([RepoResult(repo=Path("/ws"), branch="dai/run1", base="a" * 40,
+                              base_branch="main", commits=1, switched=True)],
+                  cwd=Path("/ws"))
 
     assert "git log --oneline aaaaaaaaaaaa..dai/run1" in body
     assert "git -C" not in body
@@ -198,53 +199,53 @@ def test_commands_for_the_directory_you_are_in_carry_no_dash_c():
 
 def test_the_report_names_every_repository_that_was_committed_to():
     body = report([
-        RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40, commits=2),
-        RepoResult(repo=Path("/ws/web"), branch="dai/run1", base="b" * 40, commits=1),
-        RepoResult(repo=Path("/ws/docs"), branch="dai/run1", base="c" * 40),
+        RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
+                   base_branch="main", commits=2, switched=True),
+        RepoResult(repo=Path("/ws/web"), branch="dai/run1", base="b" * 40,
+                   base_branch="main", commits=1, switched=True),
     ])
 
     assert "git -C api" in body
     assert "git -C web" in body
-    assert "3 commits in 2 of 3 repositories" in body
-    assert "docs" in body  # named as untouched, not silently dropped
+    assert "3 commits in 2 repositories" in body
 
 
 def test_the_report_drops_the_commit_range_for_a_repository_with_no_history():
-    body = report([RepoResult(repo=Path("/ws/fresh"), branch="dai/run1", commits=1)])
+    body = report([RepoResult(repo=Path("/ws/fresh"), branch="dai/run1",
+                              base_branch="main", commits=1, switched=True)])
 
     assert "git -C fresh log --oneline dai/run1" in body
     assert ".." not in body.split("## The work")[1]
 
 
-def test_a_run_that_changed_nothing_says_so_instead_of_going_quiet():
-    """The reported bug: a finished run that looks like it did nothing.
+def test_a_run_that_touched_no_repository_says_nothing_about_branches():
+    """Naming a branch that was never created is worse than silence."""
 
-    The branch is real and empty, which is a different thing from absent, and
-    the report has to be the one that says which.
-    """
+    body = report([])
 
-    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40)])
-
-    assert "Nothing on disk changed" in body
-    assert "dai/run1" in body
-    assert "reset --hard dai/run1" not in body
+    assert "## The work" not in body
+    assert "dai/run1" not in body
 
 
-def test_the_report_says_your_branch_was_moved_when_the_work_was_merged():
+def test_the_report_says_you_are_on_your_own_branch_once_merged():
     body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
-                              commits=2, merged=True)])
+                              base_branch="main", commits=2, switched=True, merged=True)])
 
-    assert "already yours" in body
-    assert "git -C api reset --hard dai/run1" not in body
+    assert "Merged into `main`" in body
+    assert "`git status` is clean" in body
+    assert "git -C api log --oneline aaaaaaaaaaaa..main" in body
     assert "git -C api reset --hard aaaaaaaaaaaa" in body  # the undo
+    assert "checkout" not in body  # you are already where you want to be
 
 
 def test_a_refused_merge_is_reported_with_its_reason():
     body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
-                              commits=2, note="you have staged changes")])
+                              base_branch="main", commits=2, switched=True,
+                              note="main moved while the agents were working")])
 
-    assert "Not merged: you have staged changes" in body
-    assert "git -C api reset --hard dai/run1" in body  # still yours to take
+    assert "Not merged into `main`: main moved" in body
+    assert "Nothing is lost" in body
+    assert "You are on `dai/run1`" in body
 
 
 def test_no_branch_means_no_git_advice():
@@ -313,20 +314,25 @@ def test_snapshots_are_on_by_default():
     assert cfg.snapshot.enabled is True
 
 
-def test_merging_is_off_unless_you_ask_for_it():
-    """It moves the branch the user is standing on. Nobody gets that by accident."""
-
+def test_merging_back_is_on_by_default():
     args = build_parser().parse_args(["t"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge_on_consensus is False
+    assert cfg.snapshot.merge is True
 
 
-def test_the_merge_flag_arms_it():
-    args = build_parser().parse_args(["t", "--merge"])
+def test_the_no_merge_flag_leaves_you_on_the_runs_branch():
+    args = build_parser().parse_args(["t", "--no-merge"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge_on_consensus is True
+    assert cfg.snapshot.merge is False
+
+
+def test_the_branch_root_can_be_named_on_the_command_line():
+    args = build_parser().parse_args(["t", "--branch-from", "develop"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.branch_from == "develop"
 
 
 def test_a_dry_run_cannot_merge_anything():
@@ -335,7 +341,7 @@ def test_a_dry_run_cannot_merge_anything():
     args = build_parser().parse_args(["t", "--dry-run", "--merge"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge_on_consensus is False
+    assert cfg.snapshot.merge is False
 
 
 def test_the_branches_are_recorded_in_the_event_log(tmp_path):

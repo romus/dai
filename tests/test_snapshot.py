@@ -122,21 +122,78 @@ def test_a_round_is_committed_and_recoverable(tmp_path):
     assert run("cat-file", "-p", f"{taken.commit}:a.txt", cwd=repo) == "two"
 
 
-def test_capture_leaves_the_users_git_state_untouched(tmp_path):
-    """The whole point: your branch, HEAD, index and tree must not move."""
+def test_a_repository_nothing_changed_in_is_not_touched_at_all(tmp_path):
+    """No branch, no commit, no switch — the run was never here."""
 
-    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n", "b.txt": "keep\n"})
-    (repo / "a.txt").write_text("edited but unstaged\n")
-    (repo / "new.txt").write_text("untracked\n")
-    run("add", "b.txt", cwd=repo)  # something deliberately left staged
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
 
     before = state(repo)
-    Snapshotter(repo, "run1").capture("r1")
-    after = state(repo)
+    snap.capture_gate(1)
+    snap.capture_gate(2)
+    snap.capture_final()
 
-    assert before == after
-    assert (repo / "a.txt").read_text() == "edited but unstaged\n"
-    assert (repo / "new.txt").exists()
+    assert state(repo) == before
+    assert run("branch", "--list", "--format=%(refname:short)", cwd=repo) == "main"
+    assert snap.summary() == []
+
+
+def test_a_repository_with_something_staged_is_left_alone(tmp_path):
+    """A staged-then-edited blob lives only in the index, which `read-tree` eats.
+
+    Snapshots record the working tree, so that content is in no commit of ours;
+    moving the repo onto a branch would leave it reachable from nothing.
+    """
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n", "b.txt": "keep\n"})
+    (repo / "b.txt").write_text("staged\n")
+    run("add", "b.txt", cwd=repo)
+    (repo / "b.txt").write_text("staged, then edited\n")
+    snap = Snapshotter(repo, "run1")
+
+    report = snap.capture_gate(1)
+    (repo / "a.txt").write_text("the agents got here\n")
+    snap.capture_gate(2)
+
+    assert any("staged" in note for note in report.skipped)
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "main"
+    assert run("branch", "--list", "--format=%(refname:short)", cwd=repo) == "main"
+    assert snap.summary() == []
+    assert run("show", ":b.txt", cwd=repo) == "staged"  # the index survives
+    assert (repo / "a.txt").read_text() == "the agents got here\n"  # never reverted
+
+
+def test_the_files_on_disk_are_never_rewritten(tmp_path):
+    """Not `git checkout`, not `git commit`: nothing may move under the agents."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+    snap.capture_gate(1)
+
+    (repo / "a.txt").write_text("theirs\n")
+    (repo / "new.txt").write_text("untracked\n")
+    stamps = {p.name: p.stat().st_mtime_ns for p in repo.glob("*.txt")}
+    snap.capture_gate(2)
+    snap.capture_final()
+
+    assert {p.name: p.stat().st_mtime_ns for p in repo.glob("*.txt")} == stamps
+    assert (repo / "a.txt").read_text() == "theirs\n"
+    assert (repo / "new.txt").read_text() == "untracked\n"
+
+
+def test_a_failing_pre_commit_hook_cannot_stop_a_round(tmp_path):
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    report = snap.capture_gate(2)
+
+    assert len(report.taken) == 1
+    assert report.skipped == []
 
 
 def test_commits_capture_the_working_tree_not_the_index(tmp_path):
@@ -170,7 +227,7 @@ def test_a_repository_with_no_commits_can_still_be_committed(tmp_path):
 
     assert run("cat-file", "-p", f"{taken.commit}:a.txt", cwd=repo) == "one"
     assert run("rev-list", "--count", taken.commit, cwd=repo) == "1"
-    assert run("rev-parse", "HEAD", cwd=repo) == ""  # still unborn
+    assert run("rev-parse", "HEAD", cwd=repo) == taken.commit  # born on our branch
 
 
 def test_an_empty_unborn_repository_produces_nothing(tmp_path):
@@ -266,25 +323,94 @@ def test_commits_are_attributed_to_dai(tmp_path):
 
 def test_the_run_gets_a_branch_of_its_own(tmp_path):
     repo = make_repo(tmp_path / "proj")
-    (repo / "a.txt").write_text("edited\n")
-
     snap = Snapshotter(repo, "run1")
-    taken = snap.capture_gate(1).taken[0]
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("edited\n")
+    taken = snap.capture_gate(2).taken[0]
 
     assert taken.branch == "dai/run1"
     assert "dai/run1" in run("branch", "--format=%(refname:short)", cwd=repo).split()
     assert run("rev-parse", "dai/run1", cwd=repo) == taken.commit
 
 
-def test_the_branch_exists_before_anything_has_changed(tmp_path):
-    """You can diff and delete the run's branch from the first round on."""
+def test_the_first_change_puts_you_on_the_branch(tmp_path):
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
 
-    repo = make_repo(tmp_path / "proj")
-    head = run("rev-parse", "HEAD", cwd=repo)
+    snap.capture_gate(1)
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "main"
 
-    Snapshotter(repo, "run1").capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    snap.capture_gate(2)
 
-    assert run("rev-parse", "dai/run1", cwd=repo) == head
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
+    assert run("status", "--porcelain", cwd=repo) == ""  # the round is committed
+
+
+def test_the_branch_is_rooted_on_the_trunk_not_on_where_you_stand(tmp_path):
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    trunk = run("rev-parse", "HEAD", cwd=repo)
+    run("checkout", "-q", "-b", "side", cwd=repo)
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    snap.capture_gate(2)
+
+    assert snap.summary()[0].base_branch == "main"
+    assert snap.summary()[0].base == trunk
+
+
+def test_branching_from_current_stays_where_you_are(tmp_path):
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    run("checkout", "-q", "-b", "side", cwd=repo)
+    snap = Snapshotter(repo, "run1", SnapshotConfig(branch_from="current"))
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    snap.capture_gate(2)
+
+    assert snap.summary()[0].base_branch == "side"
+
+
+def test_a_trunk_by_another_name_is_still_found(tmp_path):
+    """Not every repository calls it `main`."""
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    run("init", "-q", "-b", "trunk", cwd=repo)
+    run("config", "user.email", "t@example.com", cwd=repo)
+    run("config", "user.name", "test", cwd=repo)
+    (repo / "a.txt").write_text("one\n")
+    run("add", "-A", cwd=repo)
+    run("commit", "-qm", "initial", cwd=repo)
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    snap.capture_gate(2)
+
+    assert snap.summary()[0].base_branch == "trunk"
+
+
+def test_a_branch_you_are_ahead_of_is_not_used_as_the_root(tmp_path):
+    """Rooting there would fold your own commits into one `baseline`."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    run("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "mine.txt").write_text("my commit\n")
+    run("add", "-A", cwd=repo)
+    run("commit", "-qm", "mine", cwd=repo)
+    mine = run("rev-parse", "HEAD", cwd=repo)
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("two\n")
+    snap.capture_gate(2)
+
+    assert snap.summary()[0].base_branch == "side"
+    assert snap.summary()[0].base == mine
 
 
 def test_rounds_form_a_linear_chain_rooted_at_your_head(tmp_path):
@@ -317,53 +443,36 @@ def test_a_round_that_changed_nothing_leaves_no_commit(tmp_path):
     report = snap.capture_gate(3)  # the solver rebutted, changing nothing
 
     assert report.taken == []
-    assert run("rev-list", "--count", "HEAD..dai/run1", cwd=repo) == "1"
+    assert run("rev-list", "--count", "main..dai/run1", cwd=repo) == "1"
 
 
 def test_the_baseline_keeps_your_work_in_progress_out_of_the_rounds(tmp_path):
+    """The gate for round 1 is the only moment the two are still separable."""
+
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
 
     (repo / "wip.txt").write_text("mine\n")  # yours, uncommitted, before the run
-    baseline = snap.capture_gate(1).taken[0]
+    snap.capture_gate(1)
     (repo / "a.txt").write_text("theirs\n")  # the solver's first round
     first = snap.capture_gate(2).taken[0]
 
-    assert "baseline" in run("show", "-s", "--format=%s", baseline.commit, cwd=repo)
+    baseline = run("rev-parse", f"{first.commit}^", cwd=repo)
+
+    assert "baseline" in run("show", "-s", "--format=%s", baseline, cwd=repo)
+    assert run("show", "--name-only", "--format=", baseline, cwd=repo) == "wip.txt"
     assert run("show", "--name-only", "--format=", first.commit, cwd=repo) == "a.txt"
 
 
 def test_a_clean_tree_gets_no_baseline_commit(tmp_path):
-    repo = make_repo(tmp_path / "proj")
-
-    report = Snapshotter(repo, "run1").capture_gate(1)
-
-    assert report.taken == []
-    assert run("rev-list", "--count", "HEAD..dai/run1", cwd=repo) == "0"
-
-
-def test_the_branch_can_be_adopted_by_the_users_branch(tmp_path):
-    """What the report tells you to run has to actually work.
-
-    A plain `git merge --ff-only` will not: the working tree still holds the
-    agents' changes, and git refuses to overwrite them even with their own
-    content. `reset --hard` onto a tree the worktree already matches moves the
-    branch and rewrites nothing.
-    """
-
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
     (repo / "a.txt").write_text("two\n")
-    (repo / "added.txt").write_text("new\n")
-    snap.capture_final()
+    snap.capture_gate(2)
 
-    run("reset", "--hard", "dai/run1", cwd=repo)
-
-    assert (repo / "a.txt").read_text() == "two\n"
-    assert (repo / "added.txt").read_text() == "new\n"
-    assert run("status", "--porcelain", cwd=repo) == ""
-    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "main"
+    assert run("rev-list", "--count", "main..dai/run1", cwd=repo) == "1"
 
 
 def test_a_branch_called_dai_forces_a_flat_name(tmp_path):
@@ -371,9 +480,11 @@ def test_a_branch_called_dai_forces_a_flat_name(tmp_path):
 
     repo = make_repo(tmp_path / "proj")
     run("branch", "dai", cwd=repo)
-    (repo / "a.txt").write_text("edited\n")
+    snap = Snapshotter(repo, "run1")
 
-    taken = Snapshotter(repo, "run1").capture_gate(1).taken[0]
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("edited\n")
+    taken = snap.capture_gate(2).taken[0]
 
     assert taken.branch == "dai-run1"
     assert run("rev-parse", "dai-run1", cwd=repo) == taken.commit
@@ -389,6 +500,9 @@ def test_each_repository_gets_its_own_branch(tmp_path):
 
     snap = Snapshotter(root, "run1")
     snap.capture_gate(1)
+    (api / "api.txt").write_text("again\n")
+    (web / "web.txt").write_text("again\n")
+    snap.capture_gate(2)
 
     assert snap.branches == ["dai/run1"]
     for repo in (api, web):
@@ -412,15 +526,24 @@ def test_the_commit_message_names_the_round_and_the_verdict(tmp_path):
 
 def test_the_branch_prefix_is_configurable(tmp_path):
     repo = make_repo(tmp_path / "proj")
-    (repo / "a.txt").write_text("edited\n")
-
     snap = Snapshotter(repo, "run1", SnapshotConfig(branch_prefix="agents/"))
-    taken = snap.capture_gate(1).taken[0]
+
+    snap.capture_gate(1)
+    (repo / "a.txt").write_text("edited\n")
+    taken = snap.capture_gate(2).taken[0]
 
     assert taken.branch == "agents/run1"
 
 
 # --- what the run leaves behind, and where -------------------------------
+
+
+def round_of(snap, edits: dict, gate: int):
+    """One round: the agents change something, then the gate records it."""
+
+    for path, text in edits.items():
+        path.write_text(text)
+    return snap.capture_gate(gate)
 
 
 def test_the_summary_names_the_repository_the_commits_landed_in(tmp_path):
@@ -435,41 +558,39 @@ def test_the_summary_names_the_repository_the_commits_landed_in(tmp_path):
     root.mkdir()
     api = make_repo(root / "api", {"api.txt": "a\n"})
     web = make_repo(root / "web", {"web.txt": "w\n"})
-    (api / "api.txt").write_text("edited\n")
-
     snap = Snapshotter(root, "run1")
+
     snap.capture_gate(1)
+    round_of(snap, {api / "api.txt": "edited\n"}, 2)
     snap.capture_final()
 
-    rows = {entry.repo: entry for entry in snap.summary()}
+    rows = snap.summary()
 
-    assert set(rows) == {api, web}
-    assert rows[api].commits == 1 and rows[api].touched
-    assert rows[web].commits == 0 and not rows[web].touched
-    assert rows[web].branch == "dai/run1"  # real, and empty, which is not absent
+    assert [entry.repo for entry in rows] == [api]
+    assert rows[0].commits == 1 and rows[0].switched
+    assert rows[0].base_branch == "main"
+    assert run("branch", "--list", "--format=%(refname:short)", cwd=web) == "main"
 
 
-def test_the_summary_remembers_where_your_head_was_when_the_run_started(tmp_path):
-    """`HEAD..branch` stops being true the moment the user's own HEAD moves."""
+def test_the_summary_remembers_where_the_branch_was_rooted(tmp_path):
+    """`HEAD..branch` stops being true the moment anything moves."""
 
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
-    head = run("rev-parse", "HEAD", cwd=repo)
+    root = run("rev-parse", "HEAD", cwd=repo)
     snap = Snapshotter(repo, "run1")
 
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    snap.capture_gate(2)
-    (repo / "a.txt").write_text("three\n")
-    snap.capture_final()
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    round_of(snap, {repo / "a.txt": "three\n"}, 3)
 
     entry = snap.summary()[0]
 
-    assert entry.base == head
+    assert entry.base == root
     assert entry.commits == 2
     assert run("rev-list", "--count", f"{entry.base}..{entry.branch}", cwd=repo) == "2"
 
 
-def test_a_repository_that_never_got_a_branch_is_not_in_the_summary(tmp_path):
+def test_a_repository_that_was_never_switched_is_not_in_the_summary(tmp_path):
     """A branch we could not write is not an address worth printing."""
 
     root = tmp_path / "ws"
@@ -481,24 +602,28 @@ def test_a_repository_that_never_got_a_branch_is_not_in_the_summary(tmp_path):
     empty = root / "empty"
     empty.mkdir()
     run("init", "-q", "-b", "main", cwd=empty)
-    (good / "g.txt").write_text("edited\n")
-
     snap = Snapshotter(root, "run1")
+
     snap.capture_gate(1)
+    round_of(snap, {good / "g.txt": "edited\n"}, 2)
 
     assert [entry.repo for entry in snap.summary()] == [good]
 
 
-def test_the_summary_of_a_repository_with_no_history_has_no_base(tmp_path):
+def test_a_repository_with_no_history_is_rooted_on_nothing(tmp_path):
     repo = make_repo(tmp_path / "fresh", {"a.txt": "one\n"}, commit=False)
-
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
 
     entry = snap.summary()[0]
 
     assert entry.base == ""
-    assert entry.commits == 1
+    # Two: the file was already there when the run began, so it is a baseline
+    # of its own, and the round that edited it is the second.
+    assert entry.commits == 2
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
 
 
 def test_the_summary_counts_only_the_rounds_that_changed_something(tmp_path):
@@ -506,133 +631,117 @@ def test_the_summary_counts_only_the_rounds_that_changed_something(tmp_path):
     snap = Snapshotter(repo, "run1")
 
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    snap.capture_gate(2)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_gate(3)  # the solver rebutted, changing nothing
 
     assert snap.summary()[0].commits == 1
 
 
-# --- merging the work into the branch you were on -------------------------
+# --- merging back into the branch it was rooted on ------------------------
 
 
-def test_merging_moves_your_branch_onto_the_work(tmp_path):
+def test_merging_moves_the_base_branch_and_leaves_you_on_it(tmp_path):
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
-    snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    (repo / "added.txt").write_text("new\n")
-    snap.capture_final()
 
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n", repo / "added.txt": "new\n"}, 2)
+    snap.capture_final()
     merged = snap.merge()
 
     assert [entry.merged for entry in merged] == [True]
-    assert run("rev-parse", "HEAD", cwd=repo) == run("rev-parse", "dai/run1", cwd=repo)
     assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "main"
+    assert run("rev-parse", "main", cwd=repo) == run("rev-parse", "dai/run1", cwd=repo)
     assert run("status", "--porcelain", cwd=repo) == ""
     assert (repo / "a.txt").read_text() == "two\n"
     assert (repo / "added.txt").read_text() == "new\n"
-    assert snap.summary()[0].merged is True
+
+
+def test_merging_targets_the_branch_the_run_was_rooted_on(tmp_path):
+    """Not master by fiat: whatever `branch_from` settled on is the target."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    run("checkout", "-q", "-b", "side", cwd=repo)
+    snap = Snapshotter(repo, "run1", SnapshotConfig(branch_from="current"))
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    snap.merge()
+
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "side"
+    assert run("rev-parse", "side", cwd=repo) == run("rev-parse", "dai/run1", cwd=repo)
+    assert run("rev-parse", "main", cwd=repo) != run("rev-parse", "side", cwd=repo)
 
 
 def test_the_run_branch_survives_merging_so_it_can_be_undone(tmp_path):
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_final()
     base = snap.summary()[0].base
-
     snap.merge()
+
     run("reset", "--hard", base, cwd=repo)
 
     assert (repo / "a.txt").read_text() == "one\n"
     assert run("rev-parse", "--verify", "dai/run1", cwd=repo) != ""
 
 
-def test_merging_is_refused_when_something_is_staged(tmp_path):
-    """Staged-then-edited content lives in no commit of ours, only in the index.
+def test_your_work_in_progress_rides_along_as_its_own_commit(tmp_path):
+    """Merging is on by default, so the baseline lands on your branch too."""
 
-    Snapshots record the working tree, so the staged blob was never written to
-    the run's branch. Dropping the index would leave it reachable from nothing
-    at all.
-    """
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    (repo / "mine.txt").write_text("mine\n")
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    snap.merge()
+
+    subjects = run("log", "--format=%s", cwd=repo).splitlines()
+
+    assert subjects[-1] == "initial"  # yours, from before the run
+    assert "baseline" in subjects[-2]  # yours, uncommitted, now committed
+    assert run("status", "--porcelain", cwd=repo) == ""
+    assert (repo / "mine.txt").read_text() == "mine\n"
+
+
+def test_merging_is_refused_when_the_base_branch_moved(tmp_path):
+    """Fast-forwarding would drop whatever landed there meanwhile."""
 
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("staged\n")
-    run("add", "a.txt", cwd=repo)
-    (repo / "a.txt").write_text("and then edited\n")
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_final()
+    # Someone commits on main while we were on the run's branch.
+    run("update-ref", "refs/heads/main", snap.summary()[0].branch, cwd=repo)
 
-    merged = snap.merge()
-
-    assert merged[0].merged is False
-    assert "staged" in merged[0].note
-    assert run("show", ":a.txt", cwd=repo) == "staged"
-
-
-def test_merging_is_refused_when_your_branch_moved_during_the_run(tmp_path):
-    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
-    snap = Snapshotter(repo, "run1")
-    snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    snap.capture_final()
-    run("commit", "-qam", "mine", cwd=repo)  # the user committed meanwhile
-
-    before = state(repo)
     merged = snap.merge()
 
     assert merged[0].merged is False
     assert "moved" in merged[0].note
-    assert state(repo) == before
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
 
 
-def test_merging_is_refused_when_you_switched_branch(tmp_path):
-    """Another branch can sit on the same commit; that is still not where you were."""
-
+def test_merging_is_refused_when_you_moved_off_the_branch(tmp_path):
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    snap.capture_final()
-    run("checkout", "-q", "-b", "elsewhere", cwd=repo)
-
-    merged = snap.merge()
-
-    assert merged[0].merged is False
-    assert "switched" in merged[0].note
-
-
-def test_merging_is_refused_on_a_detached_head(tmp_path):
-    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
-    snap = Snapshotter(repo, "run1")
-    snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_final()
     run("checkout", "-q", "--detach", cwd=repo)
 
     merged = snap.merge()
 
     assert merged[0].merged is False
-    assert "not on a branch" in merged[0].note
-
-
-def test_merging_is_refused_when_the_tree_changed_after_the_last_commit(tmp_path):
-    """The reset would throw away whatever arrived late. Nothing here is ours."""
-
-    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
-    snap = Snapshotter(repo, "run1")
-    snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
-    snap.capture_final()
-    (repo / "late.txt").write_text("written after the run\n")
-
-    merged = snap.merge()
-
-    assert merged[0].merged is False
-    assert (repo / "late.txt").read_text() == "written after the run\n"
+    assert "moved off" in merged[0].note
 
 
 def test_a_repository_that_changed_nothing_is_left_alone(tmp_path):
@@ -640,10 +749,10 @@ def test_a_repository_that_changed_nothing_is_left_alone(tmp_path):
     root.mkdir()
     api = make_repo(root / "api", {"api.txt": "a\n"})
     web = make_repo(root / "web", {"web.txt": "w\n"})
-    (api / "api.txt").write_text("edited\n")
-
     snap = Snapshotter(root, "run1")
+
     snap.capture_gate(1)
+    round_of(snap, {api / "api.txt": "edited\n"}, 2)
     snap.capture_final()
     untouched = state(web)
 
@@ -656,8 +765,9 @@ def test_a_repository_that_changed_nothing_is_left_alone(tmp_path):
 def test_merging_never_raises_when_git_stops_working(tmp_path):
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_final()
     (repo / ".git" / "HEAD").write_text("total nonsense\n")
 
@@ -677,10 +787,10 @@ def test_branches_are_found_in_every_repository_in_the_workspace(tmp_path):
     root.mkdir()
     api = make_repo(root / "api", {"api.txt": "a\n"})
     web = make_repo(root / "web", {"web.txt": "w\n"})
-    (api / "api.txt").write_text("edited\n")
-    (web / "web.txt").write_text("edited\n")
+    snap = Snapshotter(root, "run1")
 
-    Snapshotter(root, "run1").capture_gate(1)
+    snap.capture_gate(1)
+    round_of(snap, {api / "api.txt": "edited\n", web / "web.txt": "edited\n"}, 2)
 
     found = list_branches(root)
 
@@ -694,9 +804,10 @@ def test_branches_are_found_in_every_repository_in_the_workspace(tmp_path):
 def test_a_branch_of_your_own_is_not_mistaken_for_a_run(tmp_path):
     repo = make_repo(tmp_path / "proj")
     run("branch", "feature/x", cwd=repo)
-    (repo / "a.txt").write_text("edited\n")
+    snap = Snapshotter(repo, "run1")
 
-    Snapshotter(repo, "run1").capture_gate(1)
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "edited\n"}, 2)
 
     assert [info.branch for info in list_branches(repo)] == ["dai/run1"]
 
@@ -706,20 +817,22 @@ def test_a_flat_fallback_branch_is_listed_too(tmp_path):
 
     repo = make_repo(tmp_path / "proj")
     run("branch", "dai", cwd=repo)
-    (repo / "a.txt").write_text("edited\n")
+    snap = Snapshotter(repo, "run1")
 
-    Snapshotter(repo, "run1").capture_gate(1)
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "edited\n"}, 2)
 
     assert [info.branch for info in list_branches(repo)] == ["dai-run1"]
 
 
-def test_branch_counts_survive_the_user_moving_on(tmp_path):
-    """Counted by author, not against HEAD: adopting the work must not zero it."""
+def test_branch_counts_survive_the_merge(tmp_path):
+    """Counted by author, not against HEAD: merging must not zero them."""
 
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
     snap = Snapshotter(repo, "run1")
+
     snap.capture_gate(1)
-    (repo / "a.txt").write_text("two\n")
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
     snap.capture_final()
     snap.merge()
 

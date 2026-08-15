@@ -20,8 +20,10 @@ def test_defaults_apply_when_there_is_no_config(tmp_path):
 def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tmp_path):
     """The annotated file users get must agree with the built-in defaults."""
 
-    path = ensure_config(tmp_path / "config.toml")
+    path, added = ensure_config(tmp_path / "config.toml")
     cfg = load(path)
+
+    assert added == []  # a fresh file is complete by construction
 
     assert path.read_text() == DEFAULT_CONFIG_TEXT
     assert (cfg.solver, cfg.critic) == ("claude", "codex")
@@ -32,19 +34,86 @@ def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tm
     assert cfg.stop_on_minor_only is True
     assert cfg.snapshot.enabled is True
     assert cfg.snapshot.branch_prefix == "dai/"
-    assert cfg.snapshot.merge_on_consensus is False
+    assert cfg.snapshot.merge is True
+    assert cfg.snapshot.branch_from == "default"
     assert cfg.engine("claude").critic_args == ["--permission-mode", "plan"]
     assert cfg.engine("codex").critic_args == ["--sandbox", "read-only"]
 
 
-def test_ensure_config_never_clobbers_an_existing_file(tmp_path):
+def test_ensure_config_never_clobbers_what_you_have_set(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("[roles]\nsolver = 'codex'\n")
 
     ensure_config(path)
 
-    assert "codex" in path.read_text()
+    assert "solver = 'codex'" in path.read_text()
     assert load(path).solver == "codex"
+
+
+def test_a_config_written_before_a_setting_existed_gets_it_added(tmp_path):
+    """Otherwise an option added later simply does not exist for its owner.
+
+    `dai --init` used to print the path and write nothing, so a config from an
+    older version stayed frozen at the moment it was created.
+    """
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[snapshot]\n# how it used to work\nenabled = true\nscan_depth = 3\n"
+        "\n[roles]\nsolver = 'codex'\n"
+    )
+
+    _, added = ensure_config(path)
+    cfg = load(path)
+
+    assert "snapshot.merge" in added
+    assert "snapshot.branch_from" in added
+    assert cfg.snapshot.merge is True
+    assert cfg.snapshot.enabled is True
+    assert cfg.solver == "codex"  # yours, untouched
+    assert "# how it used to work" in path.read_text()  # and so are your comments
+
+
+def test_topping_up_a_config_is_idempotent(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[snapshot]\nenabled = true\n")
+
+    ensure_config(path)
+    once = path.read_text()
+    _, added = ensure_config(path)
+
+    assert added == []
+    assert path.read_text() == once
+
+
+def test_a_setting_you_already_have_is_not_added_twice(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[snapshot]\nmerge = false\n")
+
+    _, added = ensure_config(path)
+
+    assert "snapshot.merge" not in added
+    assert load(path).snapshot.merge is False
+
+
+def test_a_missing_section_is_added_whole(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[roles]\nsolver = 'codex'\n")
+
+    _, added = ensure_config(path)
+
+    assert "snapshot.merge" in added
+    assert load(path).snapshot.branch_from == "default"
+
+
+def test_a_config_that_does_not_parse_is_left_for_you_to_fix(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[snapshot\nthis is not toml\n")
+
+    _, added = ensure_config(path)
+
+    assert added == []
+    assert path.read_text() == "[snapshot\nthis is not toml\n"
 
 
 def test_partial_config_keeps_defaults_for_everything_else():
@@ -63,11 +132,17 @@ def test_the_run_branch_can_be_named_something_else():
     assert cfg.snapshot.scan_depth == 3  # untouched keys keep their defaults
 
 
-def test_merging_the_work_back_can_be_switched_on_in_the_config():
-    cfg = from_dict({"snapshot": {"merge_on_consensus": True}})
+def test_merging_the_work_back_can_be_switched_off_in_the_config():
+    cfg = from_dict({"snapshot": {"merge": False}})
 
-    assert cfg.snapshot.merge_on_consensus is True
+    assert cfg.snapshot.merge is False
     assert cfg.snapshot.enabled is True  # untouched keys keep their defaults
+
+
+def test_the_branch_can_be_rooted_somewhere_other_than_the_trunk():
+    cfg = from_dict({"snapshot": {"branch_from": "current"}})
+
+    assert cfg.snapshot.branch_from == "current"
 
 
 def test_engine_overrides_merge_rather_than_replace():
@@ -161,7 +236,7 @@ def test_lang_flag_overrides_the_config():
 def test_the_shipped_config_documents_the_language_setting(tmp_path):
     from dai.config import ensure_config
 
-    cfg = load(ensure_config(tmp_path / "config.toml"))
+    cfg = load(ensure_config(tmp_path / "config.toml")[0])
 
     assert cfg.language == "auto"
 
@@ -196,6 +271,6 @@ def test_theme_flag_is_constrained_to_known_values():
 
 
 def test_the_shipped_config_documents_the_theme_setting(tmp_path):
-    cfg = load(ensure_config(tmp_path / "config.toml"))
+    cfg = load(ensure_config(tmp_path / "config.toml")[0])
 
     assert cfg.theme == "auto"

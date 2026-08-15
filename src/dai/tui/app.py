@@ -300,6 +300,11 @@ class DaiApp(FollowsTerminal, App):
         self.transcript = transcript
         self.snapshotter = snapshotter
         self.result: DebateResult | None = None
+        #: Where the report was written, for the caller to print after we exit.
+        self.report_path: Path | None = None
+        #: The result exists *and* has been recorded. Not the same as `result`:
+        #: between the two sit the final commit, the merge and the transcript.
+        self._settled = False
         self._paused = False
         self._runner: Worker[None] | None = None
         self._quitting = False
@@ -340,13 +345,13 @@ class DaiApp(FollowsTerminal, App):
         verdicts = self.query_one(VerdictLog)
         verdicts.note(self.debate.task, style="text", label="TASK")
         if self.snapshotter.active:
+            # Announced before the run: it moves the repo onto a branch.
             note = (
-                f"committing {len(self.snapshotter.repos)} repo(s) round by round "
-                f"→ {self.snapshotter.branch}"
+                f"any of {len(self.snapshotter.repos)} repo(s) that changes moves "
+                f"→ {self.snapshotter.branch}, a commit per round"
             )
-            # Announced before the run: it will move the branch they are on.
-            if self.snapshotter.settings.merge_on_consensus:
-                note += " · your branch moves onto it if they agree"
+            if self.snapshotter.settings.merge:
+                note += " · merged back if they agree"
             verdicts.note(note)
 
         self.debate.on_event = self._on_debate_event
@@ -383,7 +388,7 @@ class DaiApp(FollowsTerminal, App):
                 f"{self.result.outcome.value}: {self.result.reason}",
             )
             self.transcript.snapshots(report)
-            if self.snapshotter.settings.merge_on_consensus and self.result.agreed:
+            if self.snapshotter.settings.merge and self.result.agreed:
                 await asyncio.to_thread(self.snapshotter.merge)
 
         path = self.transcript.finish(
@@ -394,6 +399,10 @@ class DaiApp(FollowsTerminal, App):
             critic=self.debate.critic.name,
             repos=self.snapshotter.summary(),
         )
+        self.report_path = path
+        # Only now is the run genuinely over. Until this flag is set, `q` must
+        # go the long way round, or it exits between the result and the record.
+        self._settled = True
         self._announce(self.result, path)
 
     def _announce(self, result: DebateResult, path: Path | None) -> None:
@@ -491,10 +500,11 @@ class DaiApp(FollowsTerminal, App):
     # --- actions ----------------------------------------------------------
 
     def action_stop_debate(self) -> None:
-        if self.result is not None or (
-            self._runner is not None and self._runner.is_finished
-        ):
-            # Finished — or crashed and already announced. Nothing left to kill.
+        if self._settled or (self._runner is not None and self._runner.is_finished):
+            # Recorded — or crashed and already announced. Nothing left to kill.
+            # Deliberately not `self.result is not None`: it is set before the
+            # final commit, the merge and the transcript, and exiting in that
+            # window would lose all three.
             self.exit()
             return
         if self._quitting:
