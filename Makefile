@@ -40,8 +40,8 @@ smoke: ## End-to-end check in a throwaway sandbox — SPENDS TOKENS (override SM
 	@echo "--- matrix.md ---"; cat $(SMOKE_DIR)/matrix.md
 	@echo "--- git there: HEAD must be unmoved, only matrix.md modified ---"; \
 		cd $(SMOKE_DIR) && git log --oneline && git status --short
-	@echo "--- what dai committed ---"; \
-		cd $(SMOKE_DIR) && git branch --list 'dai/*' && git log --oneline --all --not HEAD
+	@echo "--- what dai committed ---"; uv run dai -C $(SMOKE_DIR) --snapshots
+	@cd $(SMOKE_DIR) && git log --oneline --all --not HEAD
 
 ## Run
 
@@ -74,9 +74,8 @@ runs: ## List past runs recorded in the current directory
 	uv run dai --runs
 
 .PHONY: snapshots
-snapshots: ## Show the branches dai committed its rounds to in this repo
-	@git branch --list 'dai/*' --format='  %(refname:short)  %(objectname:short)  %(contents:subject)' || true
-	@echo "  (read one: git log --oneline HEAD..<branch>)"
+snapshots: ## Show which repo dai committed its rounds to, and on what branch
+	uv run dai --snapshots
 
 ## Build
 

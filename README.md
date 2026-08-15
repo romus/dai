@@ -23,7 +23,7 @@ run out.
 make install        # create the venv, install deps
 make doctor         # check uv / claude / codex are actually installed
 make init           # write ~/.config/dai/config.toml (annotated)
-make test           # 165 tests
+make test           # 315 tests
 
 make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 ```
@@ -48,7 +48,7 @@ make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 | `make run-swap` | codex solves, claude critiques |
 | `make init` | write the default config |
 | `make runs` | list past runs recorded here |
-| `make snapshots` | show the branches dai committed its rounds to here |
+| `make snapshots` | show which repo dai committed its rounds to, and on what branch |
 | **Build & install** | |
 | `make build` | wheel + sdist into `dist/` |
 | `make install-cli` | install the `dai` command globally (uv) |
@@ -121,8 +121,10 @@ dai --lang <language> "pon la documentación al día con el código"
 dai --theme light "tidy up the docstrings in src/"
 dai --solver codex --critic claude "refactor the config loader"
 dai --no-tui "regenerate the CLI reference in docs/"
+dai --merge "bring the changelog up to date"   # if they agree, move my branch onto it
 dai --runs
 dai --show 20260814-164131-1c4x
+dai --snapshots
 ```
 
 Exit codes: `0` agreed · `1` did not agree · `2` error.
@@ -175,12 +177,15 @@ Files ignored by git stay out of the list; brand-new untracked ones do not.
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented.
 Defaults: `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to
-the critic, per-round commits on.
+the critic, per-round commits on, nothing merged into your branch.
 
 ```toml
 [tui]
 theme = "auto"                # "auto" follows the terminal; or pin "dark"/"light"
 completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
+
+[snapshot]
+merge_on_consensus = false    # on agreement, move your branch onto the run's
 ```
 
 ## A commit per round, on a branch of its own
@@ -195,22 +200,59 @@ The branch you are on, HEAD, the index and the working tree are left exactly as
 they were — dai builds each commit in a throwaway index and moves only its own
 branch. `git commit` is never run either, so your pre-commit hooks stay out of it.
 
+The directory you run in need not be the repository. It can hold several side by
+side, or be no repository at all with every one of them a level down — so the
+run, and `dai --snapshots`, tell you *which* repository ended up with what:
+
 ```bash
-make snapshots                        # the branches dai wrote
-git log --oneline HEAD..dai/<run-id>  # the rounds
-git diff HEAD dai/<run-id>            # everything they changed
-git reset --hard dai/<run-id>         # keep it
-git branch -D dai/<run-id>            # or throw it away
+dai --snapshots            # or: make snapshots
+```
+```
+raw-context-codex
+  dai/20260815-174936-p77s  3 commits  2 hours ago  dai 20260815-174936-p77s: final
+nothing committed in: TODO, arch-claude, presentations, wiki-concept
+read one: git -C <repo> log --oneline <branch>
+```
+
+A repository nothing changed in still gets the branch, pointing at the commit you
+started from — real and empty, which is not the same as absent. From there:
+
+```bash
+git -C <repo> log --oneline <base>..dai/<run-id>  # the rounds
+git -C <repo> diff <base> dai/<run-id>            # everything they changed
+git -C <repo> reset --hard dai/<run-id>           # keep it
+git -C <repo> branch -D dai/<run-id>              # or throw it away
 ```
 
 The working tree already holds the last commit, which is why `reset --hard` is
 the way to keep it: it moves your branch onto the work and rewrites no file.
 (`git merge --ff-only` refuses — from git's side those are uncommitted changes it
-would be overwriting.)
+would be overwriting.) `<base>` is printed in the report, and is used rather than
+`HEAD` because `HEAD` stops being the right answer the moment you move.
 
 `make clean-runs` deletes transcripts but leaves the branches alone, so you can
 still recover the work after it. Rename the prefix with `branch_prefix` under
 `[snapshot]`, or switch the whole thing off with `--no-snapshot`.
+
+### Taking the work automatically
+
+`--merge`, or `merge_on_consensus` under `[snapshot]`, does that `reset --hard`
+for you when — and only when — the run ends in agreement. **Off by default**, and
+announced in the banner before the run starts, because it is the one thing here
+that moves the branch you are standing on.
+
+It is a fast-forward, not a `git merge`: no merge commit, no hook of yours fires,
+and no file is rewritten, since the working tree already holds that last commit.
+Two things do change — your branch moves, and the index is reset, so anything you
+had staged stops being staged. The run's branch survives, so the undo is
+`git -C <repo> reset --hard <base>`; the report prints it.
+
+Repositories that nothing was committed in are left alone, and any repository is
+refused, with the reason printed, when a reset there would not be safe: you moved
+your branch, switched branch, or detached HEAD during the run; you have staged
+changes it would discard; or the working tree no longer matches what was
+committed. A refusal costs you nothing — the branch is still there to take by
+hand. Deadlocks, aborted runs and `q` never merge at all.
 
 ## Notes
 

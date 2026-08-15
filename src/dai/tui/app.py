@@ -16,7 +16,7 @@ from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
-from dai.snapshot import Snapshotter
+from dai.snapshot import Snapshotter, describe
 from dai.transcript import Transcript
 from dai.tui import theme
 from dai.tui.appearance import AppearanceChanged, driver_class
@@ -340,10 +340,14 @@ class DaiApp(FollowsTerminal, App):
         verdicts = self.query_one(VerdictLog)
         verdicts.note(self.debate.task, style="text", label="TASK")
         if self.snapshotter.active:
-            verdicts.note(
+            note = (
                 f"committing {len(self.snapshotter.repos)} repo(s) round by round "
                 f"→ {self.snapshotter.branch}"
             )
+            # Announced before the run: it will move the branch they are on.
+            if self.snapshotter.settings.merge_on_consensus:
+                note += " · your branch moves onto it if they agree"
+            verdicts.note(note)
 
         self.debate.on_event = self._on_debate_event
         self.debate.on_agent_event = self._on_agent_event
@@ -379,6 +383,8 @@ class DaiApp(FollowsTerminal, App):
                 f"{self.result.outcome.value}: {self.result.reason}",
             )
             self.transcript.snapshots(report)
+            if self.snapshotter.settings.merge_on_consensus and self.result.agreed:
+                await asyncio.to_thread(self.snapshotter.merge)
 
         path = self.transcript.finish(
             self.result,
@@ -386,7 +392,7 @@ class DaiApp(FollowsTerminal, App):
             cwd=self.cwd,
             solver=self.debate.solver.name,
             critic=self.debate.critic.name,
-            branch=self.snapshotter.report_branch,
+            repos=self.snapshotter.summary(),
         )
         self._announce(self.result, path)
 
@@ -403,6 +409,8 @@ class DaiApp(FollowsTerminal, App):
         if not spend.exact:
             money += f" + unmeasured ({', '.join(sorted(spend.unpriced))})"
         verdicts.note(f"{spend.turns} turns · {spend.tokens:,} tokens · {money}")
+        for line in describe(self.snapshotter.summary(), self.cwd):
+            verdicts.note(line)
         if path is not None:
             verdicts.note(f"transcript: {path}")
         verdicts.note("press q to close")
@@ -525,7 +533,10 @@ class DaiApp(FollowsTerminal, App):
             self.result = self.debate.abort_result("killed by the user")
         try:
             # A deliberate kill still deserves a final commit: it captures the
-            # half-modified tree the confirmation warned about.
+            # half-modified tree the confirmation warned about. It never merges,
+            # and not merely because an aborted run did not agree: the debate
+            # can cross the line while the cancel is in flight, leaving a
+            # consensus result here — and pressing q must never end in a reset.
             if self.snapshotter.active:
                 report = await asyncio.to_thread(
                     self.snapshotter.capture_final, "killed by the user"
@@ -537,7 +548,7 @@ class DaiApp(FollowsTerminal, App):
                 cwd=self.cwd,
                 solver=self.debate.solver.name,
                 critic=self.debate.critic.name,
-                branch=self.snapshotter.report_branch,
+                repos=self.snapshotter.summary(),
             )
         except Exception:
             pass  # recording must never stand between the user and the exit

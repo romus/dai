@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from dai.consensus import Referee
 from dai.config import SnapshotConfig
 from dai.models import AgentEvent, Outcome, Role, Severity, Issue
 from dai.orchestrator import Debate, DebateResult
-from dai.snapshot import Snapshotter
+from dai.snapshot import Snapshotter, ignore_locally
 from dai.transcript import Transcript
 from textual.app import App
 from textual.color import Color, ColorParseError
@@ -45,6 +46,22 @@ class Hanging(Scripted):
             raise
 
 
+def git_out(*args: str, cwd: Path) -> str:
+    done = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def make_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    git_out("init", "-q", "-b", "main", cwd=path)
+    git_out("config", "user.email", "t@example.com", cwd=path)
+    git_out("config", "user.name", "test", cwd=path)
+    (path / "seed.txt").write_text("seed\n")
+    git_out("add", "-A", cwd=path)
+    git_out("commit", "-qm", "initial", cwd=path)
+    return path
+
+
 def make_app(tmp_path, solver_script, critic_script, **kwargs):
     solver = Scripted("solver-engine", solver_script)
     critic = Scripted("critic-engine", critic_script)
@@ -53,6 +70,9 @@ def make_app(tmp_path, solver_script, critic_script, **kwargs):
 
 def make_app_from(tmp_path, solver, critic, **kwargs):
     appearance = kwargs.pop("appearance", "dark")
+    snapshotter = kwargs.pop(
+        "snapshotter", Snapshotter(tmp_path, "run1", SnapshotConfig(enabled=False))
+    )
     debate = Debate(
         task="fill in the table",
         cwd=tmp_path,
@@ -66,7 +86,7 @@ def make_app_from(tmp_path, solver, critic, **kwargs):
         debate,
         cwd=tmp_path,
         transcript=Transcript(tmp_path, "run1"),
-        snapshotter=Snapshotter(tmp_path, "run1", SnapshotConfig(enabled=False)),
+        snapshotter=snapshotter,
         appearance=appearance,
     )
     return app, debate
@@ -319,6 +339,39 @@ async def test_q_mid_run_asks_then_kills(tmp_path):
     assert app.result.outcome is Outcome.ABORTED
     assert "killed" in app.result.reason
     assert (tmp_path / ".dai" / "runs" / "run1" / "report.md").is_file()
+
+
+async def test_the_kill_switch_never_merges_the_work(tmp_path):
+    """Pressing q must not end in a `reset --hard`, however the run was left.
+
+    The debate can cross the finish line while the cancel is in flight, so the
+    kill path can be holding a consensus result — which is exactly when a merge
+    guarded only on agreement would fire.
+    """
+
+    repo = make_repo(tmp_path)
+    ignore_locally(repo, ".dai/")  # as the real entry point does, before anything writes
+    (repo / "a.txt").write_text("the agents got this far\n")
+    snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge_on_consensus=True))
+    solver = Hanging("solver-engine", [])
+    app, _ = make_app_from(
+        repo, solver, Scripted("critic-engine", [approve()]), snapshotter=snapshotter
+    )
+    before = git_out("rev-parse", "HEAD", cwd=repo)
+
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(solver.hung.wait(), timeout=5)
+        await pilot.press("q")
+        await wait_for(lambda: isinstance(app.screen, ConfirmQuitScreen))
+        await pilot.click("#kill")
+        await wait_for(lambda: not app.is_running)
+
+    captured = git_out("rev-parse", "dai/run1", cwd=repo)
+
+    assert captured and captured != before, "the kill should still have committed"
+    assert git_out("rev-parse", "HEAD", cwd=repo) == before, "but must not have merged"
+    assert [entry.commits for entry in snapshotter.summary()] == [1]
+    assert not any(entry.merged for entry in snapshotter.summary())
 
 
 async def test_declining_the_kill_changes_nothing(tmp_path):

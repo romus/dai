@@ -19,6 +19,7 @@ from dai.models import (
     Verdict,
 )
 from dai.orchestrator import DebateResult, Round
+from dai.snapshot import RepoResult
 from dai.transcript import (
     Transcript,
     list_runs,
@@ -163,14 +164,87 @@ def test_unresolved_issues_are_called_out():
     assert "Deadlocked" in body
 
 
-def test_report_explains_what_to_do_with_the_branch():
-    body = render_report(sample_result(), run_id="run1", task="t", cwd=Path("/tmp"),
-                         solver="claude", critic="codex", branch="dai/run1")
+def report(repos, cwd=Path("/ws")) -> str:
+    return render_report(sample_result(), run_id="run1", task="t", cwd=cwd,
+                         solver="claude", critic="codex", repos=repos)
 
-    assert "git log --oneline HEAD..dai/run1" in body
-    assert "git diff HEAD dai/run1" in body
-    assert "git reset --hard dai/run1" in body
-    assert "git branch -D dai/run1" in body
+
+def test_report_explains_what_to_do_with_the_branch():
+    """Named against the repository holding it: the branch alone is not an address.
+
+    The directory a run starts in need not be a repository — it can hold
+    several a level down — so a bare `git log HEAD..<branch>` typed there
+    answers "not a git repository", which reads like nothing was committed.
+    """
+
+    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1",
+                              base="a" * 40, commits=3)])
+
+    assert "api" in body
+    assert "git -C api log --oneline aaaaaaaaaaaa..dai/run1" in body
+    assert "git -C api diff aaaaaaaaaaaa dai/run1" in body
+    assert "git -C api reset --hard dai/run1" in body
+    assert "git branch -D" in body
+    assert "HEAD.." not in body
+
+
+def test_commands_for_the_directory_you_are_in_carry_no_dash_c():
+    body = report([RepoResult(repo=Path("/ws"), branch="dai/run1",
+                              base="a" * 40, commits=1)], cwd=Path("/ws"))
+
+    assert "git log --oneline aaaaaaaaaaaa..dai/run1" in body
+    assert "git -C" not in body
+
+
+def test_the_report_names_every_repository_that_was_committed_to():
+    body = report([
+        RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40, commits=2),
+        RepoResult(repo=Path("/ws/web"), branch="dai/run1", base="b" * 40, commits=1),
+        RepoResult(repo=Path("/ws/docs"), branch="dai/run1", base="c" * 40),
+    ])
+
+    assert "git -C api" in body
+    assert "git -C web" in body
+    assert "3 commits in 2 of 3 repositories" in body
+    assert "docs" in body  # named as untouched, not silently dropped
+
+
+def test_the_report_drops_the_commit_range_for_a_repository_with_no_history():
+    body = report([RepoResult(repo=Path("/ws/fresh"), branch="dai/run1", commits=1)])
+
+    assert "git -C fresh log --oneline dai/run1" in body
+    assert ".." not in body.split("## The work")[1]
+
+
+def test_a_run_that_changed_nothing_says_so_instead_of_going_quiet():
+    """The reported bug: a finished run that looks like it did nothing.
+
+    The branch is real and empty, which is a different thing from absent, and
+    the report has to be the one that says which.
+    """
+
+    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40)])
+
+    assert "Nothing on disk changed" in body
+    assert "dai/run1" in body
+    assert "reset --hard dai/run1" not in body
+
+
+def test_the_report_says_your_branch_was_moved_when_the_work_was_merged():
+    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
+                              commits=2, merged=True)])
+
+    assert "already yours" in body
+    assert "git -C api reset --hard dai/run1" not in body
+    assert "git -C api reset --hard aaaaaaaaaaaa" in body  # the undo
+
+
+def test_a_refused_merge_is_reported_with_its_reason():
+    body = report([RepoResult(repo=Path("/ws/api"), branch="dai/run1", base="a" * 40,
+                              commits=2, note="you have staged changes")])
+
+    assert "Not merged: you have staged changes" in body
+    assert "git -C api reset --hard dai/run1" in body  # still yours to take
 
 
 def test_no_branch_means_no_git_advice():
@@ -237,3 +311,42 @@ def test_snapshots_are_on_by_default():
     cfg = _apply_overrides(from_dict({}), args)
 
     assert cfg.snapshot.enabled is True
+
+
+def test_merging_is_off_unless_you_ask_for_it():
+    """It moves the branch the user is standing on. Nobody gets that by accident."""
+
+    args = build_parser().parse_args(["t"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.merge_on_consensus is False
+
+
+def test_the_merge_flag_arms_it():
+    args = build_parser().parse_args(["t", "--merge"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.merge_on_consensus is True
+
+
+def test_a_dry_run_cannot_merge_anything():
+    """Nothing was written, so there is no work to move a branch onto."""
+
+    args = build_parser().parse_args(["t", "--dry-run", "--merge"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.merge_on_consensus is False
+
+
+def test_the_branches_are_recorded_in_the_event_log(tmp_path):
+    """Where the commits went has to survive in the record, not just on screen."""
+
+    t = Transcript(tmp_path, "run1")
+    t.branches([RepoResult(repo=tmp_path / "api", branch="dai/run1",
+                           base="a" * 40, commits=2)])
+
+    recorded = [e for e in read_events(t.dir) if e["kind"] == "branches"]
+
+    assert recorded[0]["repos"][0]["branch"] == "dai/run1"
+    assert recorded[0]["repos"][0]["commits"] == 2
+    assert recorded[0]["repos"][0]["repo"].endswith("api")
