@@ -205,4 +205,4 @@ can still roll back after it.
 
 ## Licence
 
-Unlicensed private tool.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 romus.
