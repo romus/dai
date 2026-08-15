@@ -8,6 +8,10 @@ pushes back. The solver answers — fixing what it accepts, refusing what it
 doesn't, with reasons. That repeats until they agree, or the rounds or budget
 run out.
 
+![The task box with the @ picker open, offering index.html, and the key hints underneath](docs/screenshot-task.png)
+
+![The dai TUI mid-round: solver on the left streaming its tool calls, critic on the right waiting, round and budget in the header](docs/screenshot-debate.png)
+
 ## Requirements
 
 - `claude` and `codex` on your `PATH`, both logged in
