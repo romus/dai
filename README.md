@@ -48,7 +48,7 @@ make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 | `make run-swap` | codex solves, claude critiques |
 | `make init` | write the default config |
 | `make runs` | list past runs recorded here |
-| `make snapshots` | show the git snapshots dai took in this repo |
+| `make snapshots` | show the branches dai committed its rounds to here |
 | **Build & install** | |
 | `make build` | wheel + sdist into `dist/` |
 | `make install-cli` | install the `dai` command globally (uv) |
@@ -56,7 +56,7 @@ make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 | `make pipx-install` | install globally via pipx instead |
 | **Cleanup** | |
 | `make clean` | build artifacts and caches |
-| `make clean-runs` | recorded transcripts (leaves git snapshots alone) |
+| `make clean-runs` | recorded transcripts (leaves dai's git branches alone) |
 | `make clean-all` | everything, including `.venv` |
 
 ### Passing the task
@@ -83,7 +83,7 @@ make smoke
 
 That builds a small git repo in `/tmp/dai-smoke` holding a half-filled table,
 runs a real argument in it, then prints the result, the repo's git state (HEAD
-must be unmoved, only the edited file modified) and the snapshots taken. It
+must be unmoved, only the edited file modified) and what dai committed. It
 makes real model calls, so it costs a little. Point it elsewhere with
 `make smoke SMOKE_DIR=/tmp/somewhere`.
 
@@ -175,7 +175,7 @@ Files ignored by git stay out of the list; brand-new untracked ones do not.
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented.
 Defaults: `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to
-the critic, snapshots on.
+the critic, per-round commits on.
 
 ```toml
 [tui]
@@ -183,20 +183,34 @@ theme = "auto"                # "auto" follows the terminal; or pin "dark"/"ligh
 completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
 ```
 
-## Your git repo is not touched
+## A commit per round, on a branch of its own
 
-Before each round, every git repository found is snapshotted to its own ref —
-not a commit on your branch. HEAD, your branch, index and working tree are left
-exactly as they were. Directories without git are skipped.
+Every git repository found gets one commit per round on `dai/<run-id>`, a branch
+rooted at the HEAD you started from. Rounds that changed nothing leave no commit;
+if the tree was dirty when you started, your work-in-progress goes into a
+`baseline` commit first, so everything after it is the agents' doing. Directories
+without git are skipped.
+
+The branch you are on, HEAD, the index and the working tree are left exactly as
+they were — dai builds each commit in a throwaway index and moves only its own
+branch. `git commit` is never run either, so your pre-commit hooks stay out of it.
 
 ```bash
-make snapshots                                          # list them
-git diff refs/dai/<run-id>/r1 refs/dai/<run-id>/r2      # what changed
-git restore --source refs/dai/<run-id>/r1 -- .          # go back to it
+make snapshots                        # the branches dai wrote
+git log --oneline HEAD..dai/<run-id>  # the rounds
+git diff HEAD dai/<run-id>            # everything they changed
+git reset --hard dai/<run-id>         # keep it
+git branch -D dai/<run-id>            # or throw it away
 ```
 
-`make clean-runs` deletes transcripts but leaves these snapshots intact, so you
-can still roll back after it.
+The working tree already holds the last commit, which is why `reset --hard` is
+the way to keep it: it moves your branch onto the work and rewrites no file.
+(`git merge --ff-only` refuses — from git's side those are uncommitted changes it
+would be overwriting.)
+
+`make clean-runs` deletes transcripts but leaves the branches alone, so you can
+still recover the work after it. Rename the prefix with `branch_prefix` under
+`[snapshot]`, or switch the whole thing off with `--no-snapshot`.
 
 ## Notes
 

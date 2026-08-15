@@ -31,6 +31,7 @@ def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tm
     assert cfg.no_progress_rounds == 2
     assert cfg.stop_on_minor_only is True
     assert cfg.snapshot.enabled is True
+    assert cfg.snapshot.branch_prefix == "dai/"
     assert cfg.engine("claude").critic_args == ["--permission-mode", "plan"]
     assert cfg.engine("codex").critic_args == ["--sandbox", "read-only"]
 
@@ -52,6 +53,13 @@ def test_partial_config_keeps_defaults_for_everything_else():
     assert cfg.critic == "codex"  # explicit: roles.critic was not overridden
     assert cfg.limits.max_rounds == 5
     assert cfg.engine("claude").critic_args == ["--permission-mode", "plan"]
+
+
+def test_the_run_branch_can_be_named_something_else():
+    cfg = from_dict({"snapshot": {"branch_prefix": "agents/"}})
+
+    assert cfg.snapshot.branch_prefix == "agents/"
+    assert cfg.snapshot.scan_depth == 3  # untouched keys keep their defaults
 
 
 def test_engine_overrides_merge_rather_than_replace():

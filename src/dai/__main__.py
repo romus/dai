@@ -51,7 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
         help='TUI palette; "auto" follows the terminal',
     )
     parser.add_argument("--no-tui", action="store_true", help="plain streaming output")
-    parser.add_argument("--no-snapshot", action="store_true", help="skip git snapshots")
+    parser.add_argument(
+        "--no-snapshot", action="store_true", help="do not commit each round to a branch"
+    )
     parser.add_argument("--config", type=Path, help="use a specific config file")
     parser.add_argument("-C", "--cwd", type=Path, help="work in this directory")
     parser.add_argument("--init", action="store_true", help="write the default config and exit")
@@ -188,7 +190,7 @@ def _apply_overrides(cfg: Config, args) -> Config:
         cfg.language = args.lang
     if getattr(args, "theme", None):
         cfg.theme = args.theme
-    # Nothing is written during a dry run, so there is nothing to snapshot.
+    # Nothing is written during a dry run, so there is nothing to commit.
     if getattr(args, "no_snapshot", False) or getattr(args, "dry_run", False):
         cfg.snapshot.enabled = False
 
@@ -282,7 +284,8 @@ async def _run_headless(
     if snapshotter.active:
         print(
             _colour(
-                f"snapshotting {len(snapshotter.repos)} repo(s) to refs/dai/{transcript.run_id}/",
+                f"committing {len(snapshotter.repos)} repo(s) round by round "
+                f"to {snapshotter.branch}",
                 DIM,
             )
         )
@@ -324,11 +327,13 @@ async def _run_headless(
     async def on_round_start(number: int) -> None:
         if not snapshotter.active:
             return
-        # Snapshotting shells out to git; keep it off the event loop.
-        report = await asyncio.to_thread(snapshotter.capture, f"r{number}")
-        transcript.snapshots(f"r{number}", report)
+        # Committing shells out to git; keep it off the event loop.
+        report = await asyncio.to_thread(
+            snapshotter.capture_gate, number, debate.last_verdict
+        )
+        transcript.snapshots(report)
         for note in report.skipped:
-            print(f"  {_colour('!', YELLOW)} snapshot skipped — {note}")
+            print(f"  {_colour('!', YELLOW)} commit skipped — {note}")
 
     debate.on_event = on_event
     debate.on_agent_event = on_agent
@@ -337,8 +342,10 @@ async def _run_headless(
     result = await debate.run()
 
     if snapshotter.active:
-        final = await asyncio.to_thread(snapshotter.capture, "final")
-        transcript.snapshots("final", final)
+        final = await asyncio.to_thread(
+            snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
+        )
+        transcript.snapshots(final)
 
     report_path = transcript.finish(
         result,
@@ -346,6 +353,7 @@ async def _run_headless(
         cwd=cwd,
         solver=debate.solver.name,
         critic=debate.critic.name,
+        branch=snapshotter.report_branch,
     )
     _report(result)
     if report_path is not None:

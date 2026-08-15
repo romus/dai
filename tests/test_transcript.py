@@ -163,25 +163,25 @@ def test_unresolved_issues_are_called_out():
     assert "Deadlocked" in body
 
 
-def test_report_explains_how_to_recover_a_round():
+def test_report_explains_what_to_do_with_the_branch():
+    body = render_report(sample_result(), run_id="run1", task="t", cwd=Path("/tmp"),
+                         solver="claude", critic="codex", branch="dai/run1")
+
+    assert "git log --oneline HEAD..dai/run1" in body
+    assert "git diff HEAD dai/run1" in body
+    assert "git reset --hard dai/run1" in body
+    assert "git branch -D dai/run1" in body
+
+
+def test_no_branch_means_no_git_advice():
+    """A dry run commits nothing; naming a branch that does not exist is worse
+    than saying nothing at all."""
+
     body = render_report(sample_result(), run_id="run1", task="t", cwd=Path("/tmp"),
                          solver="claude", critic="codex")
 
-    assert "git diff refs/dai/run1/r1 refs/dai/run1/r2" in body
-    assert "git restore --source refs/dai/run1/r1" in body
-
-
-def test_recovery_hint_only_names_refs_that_exist():
-    """A one-round run has no r2; telling the user to diff against it is a dead end."""
-
-    result = sample_result()
-    result.rounds = result.rounds[:1]
-
-    body = render_report(result, run_id="run1", task="t", cwd=Path("/tmp"),
-                         solver="claude", critic="codex")
-
-    assert "git diff refs/dai/run1/r1 refs/dai/run1/final" in body
-    assert "run1/r2" not in body
+    assert "git reset" not in body
+    assert "dai/run1" not in body
 
 
 # --- listing --------------------------------------------------------------
