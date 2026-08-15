@@ -1,24 +1,31 @@
-"""Per-round commits on a branch of dai's own, leaving your branch alone.
+"""The agents work on a branch of their own, and you end up standing on it.
 
-The obvious implementation — `git add -A && git commit` — is unacceptable: it
-moves HEAD, rewrites the branch you are on and stages your own work-in-progress.
+A repository that changes is moved onto `dai/<run-id>`, rooted at the branch you
+would merge back into — `main`/`master` by default, or wherever you are
+(`branch_from`). Each round lands there as an ordinary commit, and at consensus
+the base branch is fast-forwarded onto the result, so afterwards `git status` is
+clean and `git log` reads as the work having simply been done.
 
-Instead each round is built in a throwaway index (`GIT_INDEX_FILE`), turned into
-a commit with `commit-tree`, and chained onto a branch of dai's own,
-`dai/<run-id>`. Nothing observable changes: not HEAD, not your branch, not the
-index, not the working tree. `git commit` is never run either, so your
-pre-commit hooks cannot rewrite files under the agents' feet.
+Repositories nothing changed in are not touched at all: no branch, no commit,
+no switch.
 
-What you gain is an ordinary branch with an ordinary linear history — one commit
-per round, rooted at the HEAD you started from, ready for `git log`, `git diff`
-and `git push` like anything else.
+Neither the switch nor the commits go through `git checkout` or `git commit`,
+because both rewrite files and run your hooks — a formatter firing mid-round
+would edit the tree under the agents' feet. Instead:
 
-`merge()` is the one exception, and the only thing here that moves you: asked
-for explicitly (`merge_on_consensus`), it fast-forwards the branch you were on
-onto that history. It still runs no `git commit` and no `git merge`, so no hook
-of yours fires — but it does move your branch and reset your index, which is
-why it is opt-in and why it refuses rather than guesses the moment the
-repository is not exactly where the run left it.
+    update-ref refs/heads/dai/<run>  <start>   # create the branch
+    symbolic-ref HEAD refs/heads/dai/<run>     # stand on it
+    read-tree <start>                          # index matches the new HEAD
+
+`read-tree` without `-u` writes only the index, so not one file on disk is
+rewritten and no hook fires. A round commit is the same three steps with a
+`commit-tree` in front of them.
+
+What was uncommitted before the run began is preserved as a `baseline` commit of
+its own, so everything after it is the agents' doing. The one thing that cannot
+be preserved is a staged-then-edited blob — it lives only in the index, which
+`read-tree` overwrites — so a repository with anything staged is left alone and
+said so.
 """
 
 from __future__ import annotations
@@ -58,12 +65,13 @@ class SnapshotReport:
 
 @dataclass(frozen=True)
 class RepoResult:
-    """What a run left in one repository.
+    """What a run left in one repository, and where that leaves you standing.
 
-    `base` is the commit the branch was rooted at, kept because `HEAD..branch`
-    stops being true the moment the user's own HEAD moves — and a report whose
-    commands silently print nothing is worse than no report. It is also the undo
-    for a merge.
+    `base` is the commit the run branch was rooted at — the undo for the whole
+    thing, and the left-hand side of every range the report prints. It is kept
+    rather than derived because `HEAD..` stops being true the moment anything
+    moves, and a report whose commands silently print nothing is worse than no
+    report at all.
 
     One row, not two: the report, the terminal and the TUI all want the same
     line, and a second list keyed by path would have them joining it themselves.
@@ -72,7 +80,11 @@ class RepoResult:
     repo: Path
     branch: str
     base: str = ""
+    #: The branch the run was rooted on, and merges back into.
+    base_branch: str = ""
     commits: int = 0
+    #: Whether this repository was actually moved onto the run's branch.
+    switched: bool = False
     merged: bool = False
     #: Why the merge did not happen, when one was attempted and refused.
     note: str = ""
@@ -80,6 +92,12 @@ class RepoResult:
     @property
     def touched(self) -> bool:
         return self.commits > 0
+
+    @property
+    def standing_on(self) -> str:
+        """The branch you are left on in this repository."""
+
+        return self.base_branch if self.merged else self.branch
 
 
 def git(
@@ -105,6 +123,22 @@ def git(
             raise SnapshotError(f"git {' '.join(args)}: {result.stderr.strip()}")
         return ""
     return result.stdout.strip()
+
+
+def git_ok(*args: str, cwd: Path) -> bool:
+    """Whether git succeeded, for the commands that answer with an exit code.
+
+    `merge-base --is-ancestor` prints nothing either way, so `git()` above —
+    which reads stdout — cannot tell yes from no. Anything asked as a question
+    rather than for an answer has to come through here.
+    """
+
+    return (
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True
+        ).returncode
+        == 0
+    )
 
 
 class SnapshotError(RuntimeError):
@@ -225,24 +259,19 @@ def describe(repos: Sequence[RepoResult], cwd: Path) -> list[str]:
     """
 
     if not repos:
-        return []
-
-    touched = [entry for entry in repos if entry.touched]
-    if not touched:
         return ["no repository changed — nothing was committed"]
 
     lines = []
-    for entry in touched:
-        note = ""
-        if entry.merged:
-            note = " · merged into your branch"
-        elif entry.note:
-            note = f" · not merged: {entry.note}"
+    for entry in repos:
         plural = "" if entry.commits == 1 else "s"
-        lines.append(
-            f"{entry.commits} commit{plural} in {entry.repo.name} on {entry.branch}{note}"
-        )
-        span = f"{entry.base[:12]}..{entry.branch}" if entry.base else entry.branch
+        where = f"{entry.commits} commit{plural} in {entry.repo.name}"
+        if entry.merged:
+            lines.append(f"{where}, merged into {entry.base_branch} — you are on it")
+        else:
+            lines.append(f"{where} on {entry.branch} — you are on it")
+            if entry.note:
+                lines.append(f"  not merged into {entry.base_branch}: {entry.note}")
+        span = f"{entry.base[:12]}..{entry.standing_on}" if entry.base else entry.standing_on
         lines.append(f"  {addressed(entry.repo, cwd)} log --oneline {span}")
     return lines
 
@@ -327,12 +356,21 @@ class Snapshotter:
         self._tips: dict[Path, str] = {}
         #: The branch name each repository actually accepted (see `_point`).
         self._branches: dict[Path, str] = {}
-        #: The HEAD each repository was sitting on when this run first touched it.
-        self._bases: dict[Path, str] = {}
-        #: And the branch it was on then — "" for a detached HEAD. Kept as well
-        #: as the commit, because switching to another branch that happens to
-        #: point at the same commit must not read as "you never moved".
-        self._on_branch: dict[Path, str] = {}
+        #: Everything below is recorded once, before any agent moves.
+        self._seen: set[Path] = set()
+        #: HEAD then — "" in a repository with no commits yet.
+        self._heads: dict[Path, str] = {}
+        #: The branch you were on then; "" for a detached HEAD.
+        self._origin: dict[Path, str] = {}
+        #: The working tree then, as a tree object: your work in progress.
+        self._baseline: dict[Path, str] = {}
+        #: Repositories left alone because the index held something we cannot keep.
+        self._staged: set[Path] = set()
+        #: Where the run branch was rooted: the base branch, and its tip then.
+        self._base_branch: dict[Path, str] = {}
+        self._base_tip: dict[Path, str] = {}
+        #: Repositories actually moved onto the run's branch.
+        self._switched: set[Path] = set()
         #: How many commits this run actually landed, per repository.
         self._counts: dict[Path, int] = {}
         #: What `merge` did, per repository: (moved, why it did not).
@@ -369,22 +407,24 @@ class Snapshotter:
         everything one level down — and a branch name on its own does not say
         which of them to stand in.
 
-        Only repositories this run actually pointed a branch in are listed. One
-        whose git refused us never got that far and is reported as skipped
-        instead.
+        Only repositories that actually changed are listed, because those are
+        the only ones this run touched at all. One whose git refused us, or one
+        left alone because something was staged, is reported as skipped instead.
         """
 
         rows = []
         for repo in self.repos:
-            if repo not in self._branches:
+            if repo not in self._switched:
                 continue
             merged, note = self._merged.get(repo, (False, ""))
             rows.append(
                 RepoResult(
                     repo=repo,
                     branch=self._branches[repo],
-                    base=self._bases.get(repo, ""),
+                    base=self._base_tip.get(repo, ""),
+                    base_branch=self._base_branch.get(repo, ""),
                     commits=self._counts.get(repo, 0),
+                    switched=True,
                     merged=merged,
                     note=note,
                 )
@@ -396,19 +436,40 @@ class Snapshotter:
     def capture_gate(self, round_no: int, note: str = "") -> SnapshotReport:
         """Commit at a round boundary.
 
-        The gate for round 1 fires before any agent has moved, so what it finds
-        is the baseline: your own uncommitted work, kept in a commit of its own
-        so that everything after it is the agents' doing and nothing else. Every
-        later gate fires once the previous round has been fully played out —
-        solved, critiqued and judged — which is exactly what it records.
+        The gate for round 1 fires before any agent has moved, so it commits
+        nothing: it only writes down where every repository stood, which is what
+        makes the difference between your work in progress and the agents' work
+        knowable later. Every later gate fires once the previous round has been
+        fully played out — solved, critiqued and judged — which is exactly what
+        it records.
         """
 
         if round_no <= 1:
-            return self.capture(
-                "baseline", subject="baseline (your work in progress)", note=note
-            )
+            return self.observe()
         done = round_no - 1
         return self.capture(f"round-{done}", subject=f"round {done}", note=note)
+
+    def observe(self) -> SnapshotReport:
+        """Write down where every repository stands, and change nothing.
+
+        By the time an agent has edited a file, your work in progress and its
+        work are one indistinguishable tree. The only moment they can be told
+        apart is this one, before either has happened.
+        """
+
+        report = SnapshotReport(label="baseline")
+        for repo in self.repos:
+            try:
+                self._observe(repo, at_gate=True)
+            except (SnapshotError, OSError) as exc:
+                report.skipped.append(f"{repo.name}: {exc}")
+                continue
+            if repo in self._staged:
+                report.skipped.append(
+                    f"{repo.name}: you have staged changes, which moving onto a "
+                    f"branch would discard — leaving this repo alone"
+                )
+        return report
 
     def capture_final(self, note: str = "") -> SnapshotReport:
         """Commit where the run stopped.
@@ -441,23 +502,19 @@ class Snapshotter:
     # --- adopting the work ------------------------------------------------
 
     def merge(self) -> list[RepoResult]:
-        """Fast-forward the branch you were on onto this run's work.
+        """Fast-forward the base branch onto the run's work, and stand on it.
 
-        A plain `git merge --ff-only` will not do it: the working tree still
-        holds the agents' changes uncommitted, and git refuses to overwrite them
-        even with byte-identical content of its own. `reset --hard` onto a tree
-        the working tree already matches moves the branch and rewrites no file.
+        The target is not a separate setting: it is the branch the run was
+        rooted on, so a fast-forward is possible by construction — unless that
+        branch moved underneath us, which is the one case worth refusing.
 
-        "Already matches" is the whole safety argument, so it is checked rather
-        than assumed, along with everything else that would make the reset
-        destructive. Every refusal comes back as a reason; nothing here raises,
-        because losing the merge is survivable and losing the run's record over
-        it is not.
+        Every refusal comes back as a reason; nothing here raises, because
+        losing the merge is survivable and losing the run's record over it is
+        not. A refused repository simply stays on the run's branch, which is
+        exactly where the work is.
         """
 
         for entry in self.summary():
-            if not entry.touched:
-                continue  # a branch sitting on your own HEAD has nothing to give
             try:
                 reason = self._merge_one(entry)
             except (SnapshotError, OSError) as exc:
@@ -466,92 +523,189 @@ class Snapshotter:
         return [entry for entry in self.summary() if entry.repo in self._merged]
 
     def _merge_one(self, entry: RepoResult) -> str:
-        """Move the current branch onto the run's tip; the reason it did not."""
+        """Move the base branch onto the run's tip; the reason it did not."""
 
         repo = entry.repo
         tip = self._tips.get(repo, "")
+        target = entry.base_branch
         if not tip:
             return "nothing was committed"
+        if not target:
+            return "there is no branch to merge into"
 
-        # Fast-forwarding a detached HEAD would move nothing findable again.
-        branch = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=repo, check=False)
-        if not branch:
-            return "you are not on a branch"
-        if branch != self._on_branch.get(repo, ""):
-            return "you switched branch while the agents were working"
+        here = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=repo, check=False)
+        if here != entry.branch:
+            return "you moved off the run's branch"
 
-        head = git("rev-parse", "--verify", "--quiet", "HEAD", cwd=repo, check=False)
-        if head != entry.base:
-            return "your branch moved while the agents were working"
-
-        # A reset throws the index away. Content staged but since edited exists
-        # in no commit of ours — we only ever recorded the working tree — so it
-        # would survive in no ref at all. Note `--name-only` rather than
-        # `--quiet`: the latter implies --exit-code, and `git(check=False)`
-        # answers "" for both outcomes. With no HEAD to diff against, anything
-        # in the index is staged by definition.
-        staged = (
-            git("diff-index", "--cached", "--name-only", "HEAD", cwd=repo)
-            if head
-            else git("ls-files", "--cached", cwd=repo)
+        now = git(
+            "rev-parse", "--verify", "--quiet", f"refs/heads/{target}", cwd=repo,
+            check=False,
         )
-        if staged:
-            return "you have staged changes a reset would discard"
+        if now != entry.base:
+            # Fast-forwarding would drop whatever landed there meanwhile, and
+            # rebasing on the user's behalf is not ours to decide.
+            return f"{target} moved while the agents were working"
 
-        # `reset --hard` also throws away whatever the working tree holds. Safe
-        # only while that is exactly what we committed a moment ago.
-        wanted = git("rev-parse", f"{tip}^{{tree}}", cwd=repo, check=False)
-        if not wanted or self._stage_tree(repo, tip) != wanted:
-            return "the working tree changed after the last commit"
-
-        git("reset", "--hard", tip, cwd=repo)
+        git(
+            "update-ref", "-m", f"dai {self.run_id} merge",
+            f"refs/heads/{target}", tip, cwd=repo,
+        )
+        # The index and working tree already match the tip, and the target now
+        # points at it — so standing on it rewrites nothing.
+        git("symbolic-ref", "HEAD", f"refs/heads/{target}", cwd=repo)
         return ""
 
     # --- internals --------------------------------------------------------
 
-    def _capture_one(self, repo: Path, label: str, message: str) -> Snapshot | None:
+    def _observe(self, repo: Path, *, at_gate: bool = False) -> None:
+        """Remember where a repository stood, once, before anything moves.
+
+        `at_gate` is the round-1 gate, the only moment your work in progress and
+        the agents' work are still separable. Arriving here any later — a caller
+        that committed without gating first — means they no longer are, and the
+        safe reading is that everything present is the run's: attributing your
+        work to the agents is a mislabelled commit, while the other way round
+        would drop their work on the floor.
+        """
+
+        if repo in self._seen:
+            return
+        self._seen.add(repo)
         # --verify keeps git quiet about an unborn branch; empty means no commits.
         head = git("rev-parse", "--verify", "--quiet", "HEAD", cwd=repo, check=False)
-        parent = self._tips.get(repo) or head
-        # Where this repository stood before we touched it, remembered once:
-        # asking again later would answer with wherever the user has moved to.
-        # Membership, not truthiness — an unborn repo's base is legitimately "".
-        if repo not in self._bases:
-            self._bases[repo] = head
-            self._on_branch[repo] = git(
-                "symbolic-ref", "--quiet", "--short", "HEAD", cwd=repo, check=False
-            )
+        self._heads[repo] = head
+        self._origin[repo] = git(
+            "symbolic-ref", "--quiet", "--short", "HEAD", cwd=repo, check=False
+        )
+        # `--name-only` rather than `--quiet`: the latter implies --exit-code,
+        # so `git(check=False)` would answer "" for both outcomes. With no HEAD
+        # to diff against, anything in the index is staged by definition.
+        staged = (
+            git("diff-index", "--cached", "--name-only", "HEAD", cwd=repo, check=False)
+            if head
+            else git("ls-files", "--cached", cwd=repo, check=False)
+        )
+        if staged:
+            self._staged.add(repo)
+        self._baseline[repo] = (
+            self._stage_tree(repo, head) if at_gate else self._tree_of(repo, head)
+        )
 
-        tree = self._stage_tree(repo, parent)
-
-        if not tree or self._is_unchanged(repo, tree, parent):
-            # Nothing moved this round, so no commit: an argument that spends a
-            # round talking should not leave an empty one in the history. The
-            # branch still has to exist from the start, pointed at where we came
-            # from, so it can be diffed and merged before the first real change.
-            if parent:
-                self._point(repo, parent, label)
+    def _capture_one(self, repo: Path, label: str, message: str) -> Snapshot | None:
+        self._observe(repo)
+        if repo in self._staged:
+            # Said once, at the gate. Repeating it every round would drown the
+            # rounds that did work.
             return None
 
-        commit = git(
-            "commit-tree",
-            tree,
-            *(["-p", parent] if parent else []),
-            "-m",
-            message,
+        switched = repo in self._switched
+        parent = self._tips.get(repo, "") if switched else self._heads.get(repo, "")
+        tree = self._stage_tree(repo, parent)
+        if not tree:
+            return None
+
+        # "Changed" means changed since the run began, not since your last
+        # commit: before we switch, your own work in progress is already in the
+        # baseline and must not read as a round's doing.
+        was = self._baseline.get(repo, "") if not switched else self._tree_of(repo, parent)
+        if tree == was:
+            # A round spent talking should not leave an empty commit — and in a
+            # repository that never changes, no branch either.
+            return None
+
+        if not switched:
+            parent = self._begin(repo)
+
+        commit = self._commit(repo, tree, parent, message)
+        branch = self._point(repo, commit, label)
+        if not switched:
+            git("symbolic-ref", "HEAD", f"refs/heads/{branch}", cwd=repo)
+            self._switched.add(repo)
+        # Only the index, never `-u`: not one file on disk is rewritten, so no
+        # hook of the user's can fire and nothing moves under the agents.
+        git("read-tree", commit, cwd=repo)
+        self._tips[repo] = commit
+        self._counts[repo] = self._counts.get(repo, 0) + 1
+        return Snapshot(repo=repo, branch=branch, commit=commit, label=label)
+
+    def _begin(self, repo: Path) -> str:
+        """Settle where this repository's run branch is rooted, and on what.
+
+        Returns the parent for its first round commit: the base branch's tip,
+        or a `baseline` commit holding whatever you had uncommitted, so that
+        everything after it is the agents' doing and nothing else.
+        """
+
+        branch, tip = self._base_for(repo)
+        self._base_branch[repo] = branch
+        self._base_tip[repo] = tip
+
+        baseline = self._baseline.get(repo, "")
+        if baseline and baseline != self._tree_of(repo, tip):
+            parent = self._commit(
+                repo, baseline, tip,
+                f"dai {self.run_id}: baseline (your work in progress)",
+            )
+            self._counts[repo] = self._counts.get(repo, 0) + 1
+            return parent
+        return tip
+
+    def _base_for(self, repo: Path) -> tuple[str, str]:
+        """The branch this run is rooted on, and where it pointed at the time."""
+
+        here = self._origin.get(repo, "")
+        head = self._heads.get(repo, "")
+        wanted = self.settings.branch_from
+        if wanted == "current":
+            return here, head
+
+        for name in ([wanted] if wanted != "default" else self._default_names(repo)):
+            tip = git(
+                "rev-parse", "--verify", "--quiet", f"refs/heads/{name}", cwd=repo,
+                check=False,
+            )
+            if not tip:
+                continue
+            # Rooting the run on a branch you are *ahead* of would fold your own
+            # commits into one `baseline` and carry them back on the merge. Stay
+            # where you are instead; that is the honest base.
+            if head and tip != head and not self._is_ancestor(repo, head, tip):
+                break
+            return name, tip
+        return here, head
+
+    def _default_names(self, repo: Path) -> list[str]:
+        """What this repository calls its trunk, most authoritative first."""
+
+        names = []
+        remote = git(
+            "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", cwd=repo,
+            check=False,
+        )
+        if remote.startswith("origin/"):
+            names.append(remote.removeprefix("origin/"))
+        return names + [n for n in ("main", "master", "trunk") if n not in names]
+
+    def _is_ancestor(self, repo: Path, older: str, newer: str) -> bool:
+        return git_ok("merge-base", "--is-ancestor", older, newer, cwd=repo)
+
+    def _commit(self, repo: Path, tree: str, parent: str, message: str) -> str:
+        return git(
+            "commit-tree", tree, *(["-p", parent] if parent else []), "-m", message,
             cwd=repo,
             env={
                 # These are the tool's commits, not the user's.
                 "GIT_AUTHOR_NAME": "dai",
-                "GIT_AUTHOR_EMAIL": "dai@localhost",
+                "GIT_AUTHOR_EMAIL": AUTHOR,
                 "GIT_COMMITTER_NAME": "dai",
-                "GIT_COMMITTER_EMAIL": "dai@localhost",
+                "GIT_COMMITTER_EMAIL": AUTHOR,
             },
         )
-        branch = self._point(repo, commit, label)
-        self._tips[repo] = commit
-        self._counts[repo] = self._counts.get(repo, 0) + 1
-        return Snapshot(repo=repo, branch=branch, commit=commit, label=label)
+
+    def _tree_of(self, repo: Path, commit: str) -> str:
+        if not commit:
+            return git("hash-object", "-t", "tree", os.devnull, cwd=repo, check=False)
+        return git("rev-parse", f"{commit}^{{tree}}", cwd=repo, check=False)
 
     def _stage_tree(self, repo: Path, parent: str) -> str:
         """The working tree as a git tree object, leaving the real index alone.
@@ -571,14 +725,6 @@ class Snapshotter:
                 git("read-tree", parent, cwd=repo, env=env)
             git("add", "-A", cwd=repo, env=env)
             return git("write-tree", cwd=repo, env=env)
-
-    def _is_unchanged(self, repo: Path, tree: str, parent: str) -> bool:
-        if parent:
-            return tree == git("rev-parse", f"{parent}^{{tree}}", cwd=repo, check=False)
-        # No parent means a repository with no commits at all: the only tree
-        # worth skipping is the empty one, and asking git for it keeps this
-        # right in repositories that hash with something other than SHA-1.
-        return tree == git("hash-object", "-t", "tree", os.devnull, cwd=repo, check=False)
 
     def _point(self, repo: Path, commit: str, label: str) -> str:
         """Move this run's branch to `commit`, returning the name it went by."""

@@ -30,7 +30,10 @@ class SnapshotConfig:
     enabled: bool = True
     scan_depth: int = 3
     branch_prefix: str = "dai/"
-    merge_on_consensus: bool = False
+    #: What the run's branch is rooted on — and so what it merges back into.
+    #: "default" finds the trunk, "current" stays where you are, or name one.
+    branch_from: str = "default"
+    merge: bool = True
     ignore: list[str] = field(
         default_factory=lambda: ["node_modules", ".venv", "venv", "target", "dist", "build"]
     )
@@ -124,24 +127,34 @@ stop_on_minor_only = true  # stop once nothing worse than `minor` is left open
 policy = "critic"
 
 [snapshot]
-# Every git repo dai finds gets one commit per round, on a branch of dai's own:
-# dai/<run-id>, rooted at the HEAD you started from. Capturing a round never
-# touches the branch you are on, HEAD, the index or the working tree, and never
-# runs `git commit`, so your pre-commit hooks stay out of it. Directories
-# without git are skipped; rounds that changed nothing leave no commit behind.
+# A repo the agents change is moved onto a branch of dai's own, dai/<run-id>,
+# and each round lands there as an ordinary commit. Repos nothing changed in
+# are not touched at all. Neither the switch nor the commits go through
+# `git checkout` or `git commit` — both rewrite files and run your hooks, and a
+# formatter firing mid-round would edit the tree under the agents' feet — so no
+# file on disk is ever rewritten by dai and no hook of yours fires. Whatever was
+# uncommitted before the run is kept as a `baseline` commit of its own.
 # `dai --snapshots` lists which repo ended up with what.
 enabled = true
 scan_depth = 3
 branch_prefix = "dai/"
 
-# The one setting that moves you, which is why it is off. On consensus — and
-# only consensus — fast-forward the branch you were on onto the run's work, by
-# running `git reset --hard dai/<run-id>` in every repo that got commits. No
-# file is rewritten (the working tree already holds that last commit) and no
-# hook fires, but your branch moves and your index is reset, so anything you
-# had staged stops being staged. Any repo whose branch or working tree moved
-# since the run finished is refused, with the reason printed.
-merge_on_consensus = false
+# What the run's branch is rooted on — and therefore what it merges back into.
+#   "default" — the repo's trunk: origin/HEAD, else main, master or trunk
+#   "current" — the branch you are standing on
+#   or name one outright, e.g. "develop"
+# If you are ahead of the branch named here, dai roots the run where you are
+# instead: folding your own commits into one `baseline` and carrying them back
+# on the merge is not something to do quietly.
+branch_from = "default"
+
+# On consensus, fast-forward that base branch onto the run's work and leave you
+# standing on it, so `git status` is clean and `git log` reads as the work
+# having simply been done. Turn this off to be left on dai/<run-id> instead,
+# with the work committed there and yours to merge by hand. A repo whose base
+# branch moved during the run is refused, with the reason printed, and stays on
+# dai/<run-id>. Only consensus merges: a deadlock or a run you killed never does.
+merge = true
 
 ignore = ["node_modules", ".venv", "venv", "target", "dist", "build"]
 
@@ -171,14 +184,109 @@ critic_args = ["--sandbox", "read-only"]
 """
 
 
-def ensure_config(path: Path | None = None) -> Path:
-    """Write the annotated default config if the user has none yet."""
+def ensure_config(path: Path | None = None) -> tuple[Path, list[str]]:
+    """Write the annotated default config, or top up the one already there.
+
+    Returns the path and whatever was added. A config written a version ago is
+    otherwise frozen at the moment it was created: options added since simply
+    do not exist for its owner, who has no way to discover them short of
+    reading the source. So the missing keys are appended, with the comments
+    that explain them, and nothing you have set is touched.
+    """
 
     target = path or config_path()
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(DEFAULT_CONFIG_TEXT, encoding="utf-8")
-    return target
+        return target, []
+
+    try:
+        existing = target.read_text(encoding="utf-8")
+        with target.open("rb") as handle:
+            present = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        # An unreadable or broken config is the user's to fix; guessing at it
+        # would only make the mess bigger.
+        return target, []
+
+    topped_up, added = _top_up(existing, present)
+    if added:
+        try:
+            target.write_text(topped_up, encoding="utf-8")
+        except OSError:
+            return target, []
+    return target, added
+
+
+def _top_up(existing: str, present: dict) -> tuple[str, list[str]]:
+    """Add the settings a config has never heard of, and change nothing else."""
+
+    lines = existing.splitlines(keepends=True)
+    added: list[str] = []
+    # Late to early, so each insertion leaves the earlier offsets valid.
+    for section, key, block in reversed(_settings(DEFAULT_CONFIG_TEXT)):
+        if key in _table(present, section):
+            continue
+        at = _end_of(lines, section)
+        if at is None:
+            lines.append(f"\n[{section}]\n")
+            at = len(lines)
+        lines[at:at] = ["\n", *block]
+        added.append(f"{section}.{key}")
+    return "".join(lines), sorted(added)
+
+
+def _table(raw: dict, section: str) -> dict:
+    """The table a `[dotted.header]` names, which TOML has parsed as nesting."""
+
+    here = raw
+    for part in section.split("."):
+        here = here.get(part) if isinstance(here, dict) else None
+        if not isinstance(here, dict):
+            return {}
+    return here
+
+
+def _settings(text: str) -> list[tuple[str, str, list[str]]]:
+    """Every `section, key, its comment block and line` in the shipped config."""
+
+    found, comments, section = [], [], ""
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section, comments = stripped[1:-1], []
+        elif stripped.startswith("#"):
+            comments.append(line)
+        elif "=" in stripped and section:
+            found.append((section, stripped.split("=", 1)[0].strip(), [*comments, line]))
+            comments = []
+        else:
+            comments = []
+    return found
+
+
+def _end_of(lines: list[str], section: str) -> int | None:
+    """Where `[section]` ends: the next table, or the end of the file.
+
+    A second `[section]` appended at the bottom would be a duplicate table and
+    so a parse error, which is why this inserts rather than appends.
+    """
+
+    start = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == f"[{section}]":
+            start = index
+        elif start is not None and stripped.startswith("[") and stripped.endswith("]"):
+            while index > start + 1 and not lines[index - 1].strip():
+                index -= 1
+            return index
+    if start is None:
+        return None
+    end = len(lines)
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return end
 
 
 def load(path: Path | None = None) -> Config:
@@ -243,7 +351,8 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
             enabled=bool(snap.get("enabled", True)),
             scan_depth=int(snap.get("scan_depth", 3)),
             branch_prefix=str(snap.get("branch_prefix", "dai/")),
-            merge_on_consensus=bool(snap.get("merge_on_consensus", False)),
+            branch_from=str(snap.get("branch_from", "default") or "default"),
+            merge=bool(snap.get("merge", True)),
             ignore=_strings(snap.get("ignore"), SnapshotConfig().ignore),
         ),
         engines=engines,

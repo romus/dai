@@ -230,85 +230,66 @@ def _render_work(repos: Sequence[RepoResult], cwd: Path) -> list[str]:
     having committed nothing.
     """
 
-    # No repositories at all means nothing was committed — a dry run, or
-    # snapshots switched off. Naming a branch that does not exist would be
-    # worse than saying nothing.
+    # No repositories means none of them changed — or a dry run, or snapshots
+    # switched off. Naming a branch that does not exist is worse than silence.
     if not repos:
         return []
 
-    touched = [entry for entry in repos if entry.touched]
-    idle = [entry for entry in repos if not entry.touched]
     lines = ["## The work, round by round", ""]
-
-    if not touched:
-        lines += [
-            "Nothing on disk changed, so nothing was committed. The branch "
-            f"`{repos[0].branch}` exists in {_count(repos, 'repository', 'repositories')}",
-            "anyway, pointing at the commit you started from — there is simply nothing",
-            "on it yet. Delete it with `git branch -D`.",
-            "",
-        ]
-        return lines
-
-    total = sum(entry.commits for entry in touched)
-    where = (
-        f"{len(touched)} of {_count(repos, 'repository', 'repositories')}"
-        if idle
-        else _count(touched, "repository", "repositories")
-    )
+    total = sum(entry.commits for entry in repos)
     lines += [
-        f"{_count(total, 'commit', 'commits')} in {where}, on a branch rooted where you",
-        "started. Capturing them moved nothing: not the branch you are on, not HEAD,",
-        "not the index, not the working tree.",
+        f"{_count(total, 'commit', 'commits')} in "
+        f"{_count(repos, 'repository', 'repositories')}. Repositories nothing changed",
+        "in were not touched at all — no branch, no commit, no switch.",
         "",
     ]
 
-    for entry in touched:
+    for entry in repos:
         at = addressed(entry.repo, cwd)
         base = entry.base[:12]
         lines += [
-            f"### {_name(entry.repo, cwd)} — `{entry.branch}`, "
+            f"### {_name(entry.repo, cwd)} — `{entry.standing_on}`, "
             f"{_count(entry.commits, 'commit', 'commits')}",
+            "",
+        ]
+        if entry.merged:
+            lines += [
+                f"Merged into `{entry.base_branch}`, and that is the branch you are on "
+                "now — the",
+                "work is committed, and `git status` is clean.",
+                "",
+                "```",
+                f"{at} log --oneline {f'{base}..' if base else ''}{entry.base_branch}",
+            ]
+            if base:
+                lines += [
+                    f"{at} diff {base} {entry.base_branch}",
+                    f"{at} reset --hard {base}   # undo, putting {entry.base_branch} back",
+                ]
+            lines += ["```", ""]
+            continue
+
+        lines += [
+            f"You are on `{entry.branch}`, with the work committed there.",
             "",
             "```",
             f"{at} log --oneline {f'{base}..' if base else ''}{entry.branch}",
         ]
         if base:
             lines.append(f"{at} diff {base} {entry.branch}")
-
-        if entry.merged:
-            # Offering `reset --hard <branch>` again would be a no-op; the undo
-            # is the only thing standing between the user and their reflog.
+        if entry.base_branch:
+            lines.append(
+                f"{at} checkout {entry.base_branch}   # back where you started"
+            )
+        lines += ["```", ""]
+        if entry.note:
             lines += [
-                f"{at} reset --hard {base}   # undo the merge",
-                "```",
-                "",
-                "Your branch was moved onto this work — it is already yours.",
+                f"Not merged into `{entry.base_branch}`: {entry.note}. Nothing is lost —",
+                "the work is committed on the branch above, yours to merge by hand.",
                 "",
             ]
-            continue
 
-        lines += [f"{at} reset --hard {entry.branch}", "```", ""]
-        if entry.note:
-            lines += [f"Not merged: {entry.note}.", ""]
-
-    if any(not entry.merged for entry in touched):
-        lines += [
-            "The working tree already holds the last commit, which is why `reset --hard`",
-            "is the way to keep it: it moves your branch onto the work and rewrites no",
-            "file. (`git merge --ff-only` refuses — from git's side those are uncommitted",
-            "changes it would be overwriting.)",
-            "",
-        ]
-    lines += ["To throw a run away instead, delete its branch with `git branch -D`.", ""]
-
-    if idle:
-        lines += [
-            "Unchanged, branch left pointing where you started: "
-            + ", ".join(f"`{entry.repo.name}`" for entry in idle)
-            + ".",
-            "",
-        ]
+    lines += ["To throw a run away, delete its branch with `git branch -D`.", ""]
     return lines
 
 

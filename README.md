@@ -121,7 +121,8 @@ dai --lang <language> "pon la documentación al día con el código"
 dai --theme light "tidy up the docstrings in src/"
 dai --solver codex --critic claude "refactor the config loader"
 dai --no-tui "regenerate the CLI reference in docs/"
-dai --merge "bring the changelog up to date"   # if they agree, move my branch onto it
+dai --no-merge "bring the changelog up to date"   # leave it on the run's branch
+dai --branch-from current "tidy up the tests"    # branch off where I am, not the trunk
 dai --runs
 dai --show 20260814-164131-1c4x
 dai --snapshots
@@ -177,7 +178,7 @@ Files ignored by git stay out of the list; brand-new untracked ones do not.
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented.
 Defaults: `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to
-the critic, per-round commits on, nothing merged into your branch.
+the critic, per-round commits on, merged back into your branch on agreement.
 
 ```toml
 [tui]
@@ -185,20 +186,32 @@ theme = "auto"                # "auto" follows the terminal; or pin "dark"/"ligh
 completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
 
 [snapshot]
-merge_on_consensus = false    # on agreement, move your branch onto the run's
+branch_from = "default"       # the trunk; or "current", or a branch name
+merge = true                  # on agreement, fast-forward that branch onto the work
 ```
 
 ## A commit per round, on a branch of its own
 
-Every git repository found gets one commit per round on `dai/<run-id>`, a branch
-rooted at the HEAD you started from. Rounds that changed nothing leave no commit;
-if the tree was dirty when you started, your work-in-progress goes into a
-`baseline` commit first, so everything after it is the agents' doing. Directories
-without git are skipped.
+A repository the agents change is moved onto `dai/<run-id>`, a branch rooted on
+whatever it would merge back into — `main`/`master` by default. Each round lands
+there as an ordinary commit, and at consensus that base branch is fast-forwarded
+onto the result, so afterwards you are standing on your own branch with the work
+committed, `git status` clean and `git log` reading as the work having simply
+been done.
 
-The branch you are on, HEAD, the index and the working tree are left exactly as
-they were — dai builds each commit in a throwaway index and moves only its own
-branch. `git commit` is never run either, so your pre-commit hooks stay out of it.
+**Repositories nothing changed in are not touched at all** — no branch, no
+commit, no switch. Directories without git are skipped.
+
+Whatever was uncommitted before you started is kept as a `baseline` commit of its
+own, so everything after it is the agents' doing.
+
+Neither the switch nor the commits go through `git checkout` or `git commit`,
+because both rewrite files and run your hooks — a formatter firing mid-round
+would edit the tree under the agents' feet. dai moves HEAD with `symbolic-ref`
+and syncs the index with `read-tree`, so **not one file on disk is ever rewritten
+by dai and no hook of yours fires**. The one thing it cannot preserve is a
+staged-then-edited blob, which lives only in the index: a repository with
+anything staged is left alone, and says so.
 
 The directory you run in need not be the repository. It can hold several side by
 side, or be no repository at all with every one of them a level down — so the
@@ -214,45 +227,45 @@ nothing committed in: TODO, arch-claude, presentations, wiki-concept
 read one: git -C <repo> log --oneline <branch>
 ```
 
-A repository nothing changed in still gets the branch, pointing at the commit you
-started from — real and empty, which is not the same as absent. From there:
-
 ```bash
-git -C <repo> log --oneline <base>..dai/<run-id>  # the rounds
-git -C <repo> diff <base> dai/<run-id>            # everything they changed
-git -C <repo> reset --hard dai/<run-id>           # keep it
-git -C <repo> branch -D dai/<run-id>              # or throw it away
+git -C <repo> log --oneline <base>..<branch>  # the rounds
+git -C <repo> diff <base> <branch>            # everything they changed
+git -C <repo> reset --hard <base>             # undo the lot
+git -C <repo> branch -D dai/<run-id>          # forget the run
 ```
 
-The working tree already holds the last commit, which is why `reset --hard` is
-the way to keep it: it moves your branch onto the work and rewrites no file.
-(`git merge --ff-only` refuses — from git's side those are uncommitted changes it
-would be overwriting.) `<base>` is printed in the report, and is used rather than
-`HEAD` because `HEAD` stops being the right answer the moment you move.
+`<base>` is printed in the report, and is used rather than `HEAD` because `HEAD`
+stops being the right answer the moment anything moves.
 
 `make clean-runs` deletes transcripts but leaves the branches alone, so you can
 still recover the work after it. Rename the prefix with `branch_prefix` under
 `[snapshot]`, or switch the whole thing off with `--no-snapshot`.
 
-### Taking the work automatically
+### Where the branch is rooted, and what it merges into
 
-`--merge`, or `merge_on_consensus` under `[snapshot]`, does that `reset --hard`
-for you when — and only when — the run ends in agreement. **Off by default**, and
-announced in the banner before the run starts, because it is the one thing here
-that moves the branch you are standing on.
+One setting decides both, because they are the same thing — `branch_from` under
+`[snapshot]`, or `--branch-from`:
 
-It is a fast-forward, not a `git merge`: no merge commit, no hook of yours fires,
-and no file is rewritten, since the working tree already holds that last commit.
-Two things do change — your branch moves, and the index is reset, so anything you
-had staged stops being staged. The run's branch survives, so the undo is
-`git -C <repo> reset --hard <base>`; the report prints it.
+| | |
+|---|---|
+| `"default"` | the repository's trunk: `origin/HEAD`, else `main`, `master`, `trunk` |
+| `"current"` | the branch you are standing on |
+| a name | that branch, e.g. `"develop"` |
 
-Repositories that nothing was committed in are left alone, and any repository is
-refused, with the reason printed, when a reset there would not be safe: you moved
-your branch, switched branch, or detached HEAD during the run; you have staged
-changes it would discard; or the working tree no longer matches what was
-committed. A refusal costs you nothing — the branch is still there to take by
-hand. Deadlocks, aborted runs and `q` never merge at all.
+If you are *ahead* of the branch named there, dai roots the run where you are
+instead: folding your own commits into one `baseline` and carrying them back on
+the merge is not something to do quietly.
+
+`merge = true` under `[snapshot]`, or `--no-merge` to turn it off for one run.
+**On by default.** Only consensus merges — a deadlock, a run out of budget, or
+one you killed with `q` never does, and leaves you on `dai/<run-id>` with the
+work committed there and yours to merge by hand.
+
+A repository whose base branch moved during the run is refused, with the reason
+printed, and also stays on `dai/<run-id>`. A refusal costs you nothing. Because
+merging is on by default, the `baseline` commit holding your own pre-run
+work-in-progress lands on your branch too, authored `dai`; the report prints the
+undo, `git -C <repo> reset --hard <base>`.
 
 ## Notes
 
