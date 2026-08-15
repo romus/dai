@@ -1,0 +1,10 @@
+Reading additional input from stdin...
+{"type":"thread.started","thread_id":"01a00010-d0e5-7452-90ce-d44384d0c8fa"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll read the file first."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"cat data.txt"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"cat data.txt","aggregated_output":"alpha\nbeta\ngamma\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"wc -l data.txt"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"wc -l data.txt","aggregated_output":"       3 data.txt","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"The file has 3 lines."}}
+{"type":"turn.completed","usage":{"input_tokens":20297,"cached_input_tokens":11008,"cache_write_input_tokens":0,"output_tokens":94,"reasoning_output_tokens":52}}

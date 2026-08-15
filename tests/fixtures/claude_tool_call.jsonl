@@ -1,0 +1,12 @@
+{"type":"system","subtype":"init","session_id":"cd27bb7c-30d9-4a6b-ae92-a5140d1b68fa","cwd":"/tmp/probe","model":"claude-haiku-4-5"}
+{"type":"rate_limit_event","rate_limit":{"status":"allowed"}}
+{"type":"system","subtype":"thinking_tokens","tokens":64}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me "}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"check."}}}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"I should read the file."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/tmp/probe/data.txt"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"alpha\nbeta\ngamma\n"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_2","name":"Bash","input":{"command":"wc -l /tmp/probe/data.txt","description":"count lines"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"The file has 3 lines."}]}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"cd27bb7c-30d9-4a6b-ae92-a5140d1b68fa","result":"The file has 3 lines.","total_cost_usd":0.0271819,"num_turns":3,"duration_ms":4668,"usage":{"input_tokens":12,"output_tokens":57,"cache_creation_input_tokens":10257,"cache_read_input_tokens":15928,"output_tokens_details":{"thinking_tokens":41}}}
