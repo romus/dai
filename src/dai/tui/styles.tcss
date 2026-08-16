@@ -323,9 +323,12 @@ MergeScreen > Vertical {
     border-bottom: solid $dai-rule;
 }
 
+/* No max-height here: `MergeScreen._fit` owns it, because the cap has to be
+   whatever the rest of the card is not using. A number in the sheet cannot
+   know that, and the card clips rather than scrolls when it is wrong — which
+   costs you the button and the way out, not a row. */
 #merge-rows {
     height: auto;
-    max-height: 18;
     scrollbar-size-vertical: 1;
     scrollbar-background: $surface;
     scrollbar-color: $dai-rule;
@@ -354,25 +357,63 @@ RepoRow.-cursor {
     border-top: solid $dai-rule;
 }
 
-#merge-go {
+/* One width for both, set rather than derived. `auto` sizes each control to its
+   own label, and an `fr` split has to give its remainder to one of them —
+   neither can be even at every terminal size, and a number can. 24 holds
+   "Merge 12 selected"; anything longer is cut rather than wrapped, since a
+   second line would push the row past the height it is drawn at.
+   `min-width` has to be said: Button ships 16 and the Cell beside it ships
+   none, which is what made them diverge on a narrow terminal. */
+#merge-go,
+#merge-toggle {
+    width: 24;
+    min-width: 24;
+    max-width: 24;
     margin: 0 1 0 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
 /* A keycap, not an action: there is no row a click on it could mean. Bordered
    and three rows, like the phase pill, so it sits level with the button. */
 #merge-toggle {
-    width: auto;
     height: 3;
     padding: 0 1;
     border: round $dai-rule;
     content-align: center middle;
 }
 
+/* Cut, never wrapped — wrapping turns this into a three-line esc/Keep/the
+   column that drags the whole row taller. */
 #merge-keep {
     width: 1fr;
+    min-width: 0;
     height: 3;
     content-align: right middle;
     text-align: right;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* Too short for prose, or too narrow for the hint: fold away the parts that
+   are not the question, rather than crop the parts that are. */
+MergeScreen.-short #merge-lede,
+MergeScreen.-short #merge-footnote {
+    display: none;
+}
+
+MergeScreen.-narrow #merge-keep {
+    display: none;
+}
+
+/* Still one width for both — narrower, not uneven. Two 24s plus the gap need
+   49 columns, which is more than a 64-column terminal leaves inside the card,
+   and the pill loses its right-hand border first. */
+MergeScreen.-narrow #merge-go,
+MergeScreen.-narrow #merge-toggle {
+    width: 22;
+    min-width: 22;
+    max-width: 22;
 }
 
 #merge-footnote {

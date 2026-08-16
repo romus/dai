@@ -685,6 +685,91 @@ async def test_q_on_the_merge_screen_keeps_the_branches_rather_than_killing(tmp_
     assert (tmp_path / ".dai" / "runs" / "run1" / "report.md").is_file()
 
 
+def many_candidates(tmp_path, count):
+    return [
+        MergeCandidate(
+            repo=tmp_path / f"r{i}", label=f"r{i}", branch="dai/run1",
+            base_branch="main", added=3, removed=1, files=("a.py", "b.py"),
+        )
+        for i in range(count)
+    ]
+
+
+def answerable(screen) -> list[str]:
+    """The controls the user needs, that the compositor is not actually drawing.
+
+    Deliberately not "is the screen still on the stack" — it always was. What
+    the clipping bug took was the bottom of the card, so what has to be asserted
+    is that the way to answer is on screen, not that the screen exists.
+    """
+
+    visible = screen.app.screen._compositor.visible_widgets
+    return [
+        name
+        for name in ("#merge-go", "#merge-toggle", "#merge-actions")
+        if screen.query_one(name) not in visible
+    ]
+
+
+async def test_the_two_controls_are_the_same_width_at_any_size(tmp_path):
+    """`auto` sizes each to its own label, and an fr split favours one of them."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = MergeScreen(many_candidates(tmp_path, 3), run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        for width in (120, 100, 88, 80, 72, 64):
+            await pilot.resize_terminal(width, 34)
+            await pilot.pause()
+            go = screen.query_one("#merge-go", Button)
+            toggle = screen.query_one("#merge-toggle", Cell)
+            assert go.region.width == toggle.region.width, f"uneven at {width} columns"
+
+
+async def test_shrinking_the_terminal_never_takes_away_the_answer(tmp_path):
+    """The card is clamped without anything inside giving way, so it clipped —
+    and what it clipped was the button, the way out and the footnote."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await settle(app)
+        # Eight repos: the list is long enough that the card wants more height
+        # than a small terminal will give it.
+        screen = MergeScreen(many_candidates(tmp_path, 8), run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert answerable(screen) == []
+
+        for size in ((100, 24), (80, 24), (100, 18), (64, 16), (120, 40)):
+            await pilot.resize_terminal(*size)
+            for _ in range(3):
+                await pilot.pause()
+            assert answerable(screen) == [], f"cut off at {size[0]}x{size[1]}"
+
+
+async def test_a_roomy_terminal_gets_no_bigger_a_card_than_it_needs(tmp_path):
+    """The list takes the leftover height; it must not go looking for more."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await settle(app)
+        screen = MergeScreen(many_candidates(tmp_path, 1), run_branch="dai/run1")
+        app.push_screen(screen)
+        for _ in range(3):
+            await pilot.pause()
+
+        # One repo is two rows of content; the card is its chrome plus that,
+        # nowhere near the 90% of the screen it is allowed to take.
+        assert screen.query_one("#merge-card").region.height < 24
+
+
 async def test_merging_without_asking_never_shows_the_screen(tmp_path):
     app, snapshotter = agreed_run(tmp_path, merge=Merge.ALWAYS)
     seen = []

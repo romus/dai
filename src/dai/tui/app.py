@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -216,6 +216,14 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
     #: Nothing here is focusable, on purpose — see BINDINGS.
     AUTO_FOCUS = ""
 
+    #: Rows shown before the list starts scrolling, when there is room for them.
+    MAX_ROWS = 18
+
+    #: A short terminal drops the two lines that are prose rather than substance,
+    #: and a narrow one drops the hint before it crushes the controls.
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (22, "-tall")]
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (74, "-wide")]
+
     BINDINGS = [
         Binding("up,k", "cursor(-1)", "up", show=False),
         Binding("down,j", "cursor(1)", "down", show=False),
@@ -247,7 +255,7 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         )
 
     def compose(self) -> ComposeResult:
-        with Vertical():
+        with Vertical(id="merge-card"):
             yield Cell(self._paint_outcome, id="merge-outcome")
             yield Cell(self._paint_title, id="merge-title")
             yield Cell(self._paint_lede, id="merge-lede")
@@ -265,6 +273,41 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
 
     def on_mount(self) -> None:
         self._sync()
+        # The first fit has to wait for the children to have a real size.
+        self.call_after_refresh(self._fit)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._fit()
+
+    def _fit(self) -> None:
+        """Hand the list the height the rest of the card is not using.
+
+        The card is `height: auto` under a `max-height`, which clamps it without
+        making anything inside give way — so past a certain terminal height the
+        surplus is simply clipped, and what it clips is the bottom: the button,
+        the way out, and the promise that nothing has been written yet. A
+        question you cannot see how to answer is worse than a short list, and
+        the list is the only part of this screen that can honestly be shortened,
+        so it is the part that pays.
+
+        The chrome is measured, not counted. A constant here would be a number
+        nobody remembers to change, and the first line added to the card would
+        start quietly cutting the answer off again.
+        """
+
+        card = self.query_one("#merge-card", Vertical)
+        listing = self.query_one("#merge-rows", _RowList)
+        # `outer_size` counts border and padding but not margin, and three of
+        # these lines carry one — leave them out and the card overflows by
+        # exactly that much, which is the button's bottom edge.
+        chrome = sum(
+            child.outer_size.height + child.styles.margin.height
+            for child in card.children
+            if child is not listing
+        )
+        # The 90% and the border-plus-padding mirror `MergeScreen > Vertical`.
+        budget = (self.size.height * 9) // 10 - 4 - chrome
+        listing.styles.max_height = max(2, min(self.MAX_ROWS, budget))
 
     def repaint(self) -> None:
         """Draw every line again, in whichever palette is active now.
