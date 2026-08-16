@@ -374,14 +374,6 @@ RepoRow.-cursor {
     text-overflow: ellipsis;
 }
 
-/* A keycap, not an action: there is no row a click on it could mean. Bordered
-   and three rows, like the phase pill, so it sits level with the button. */
-#merge-toggle {
-    height: 3;
-    padding: 0 1;
-    border: round $dai-rule;
-    content-align: center middle;
-}
 
 /* Cut, never wrapped — wrapping turns this into a three-line esc/Keep/the
    column that drags the whole row taller. */

@@ -726,8 +726,54 @@ async def test_the_two_controls_are_the_same_width_at_any_size(tmp_path):
             await pilot.resize_terminal(width, 34)
             await pilot.pause()
             go = screen.query_one("#merge-go", Button)
-            toggle = screen.query_one("#merge-toggle", Cell)
+            toggle = screen.query_one("#merge-toggle", Button)
             assert go.region.width == toggle.region.width, f"uneven at {width} columns"
+
+
+async def test_the_toggle_button_can_actually_be_pressed(tmp_path):
+    """It looks pressable, so it has to be — and it acts on the cursor row."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = MergeScreen(many_candidates(tmp_path, 3), run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert len(screen._selected) == 3
+
+        await pilot.click("#merge-toggle")
+        await pilot.pause()
+
+        assert len(screen._selected) == 2, "the button did nothing"
+        assert "Merge 2 selected" in str(screen.query_one("#merge-go", Button).label)
+
+
+async def test_pressing_a_button_does_not_take_the_keys_with_it(tmp_path):
+    """A focused Button answers `enter` itself.
+
+    Without this, one click on Toggle would leave the next `enter` pressing
+    Toggle again rather than merging — the screen's own bindings would never
+    see the key.
+    """
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = MergeScreen(many_candidates(tmp_path, 3), run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.click("#merge-toggle")
+        await pilot.pause()
+
+        assert screen.focused is None, "a control took focus"
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, MergeScreen), "enter did not merge"
 
 
 async def test_shrinking_the_terminal_never_takes_away_the_answer(tmp_path):

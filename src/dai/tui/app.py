@@ -267,11 +267,20 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
                     )
             with Horizontal(id="merge-actions"):
                 yield Button(self._merge_label(), variant="primary", id="merge-go")
-                yield Cell(self._paint_toggle, id="merge-toggle")
+                # A Button, not a keycap: same border, same box, so the pair
+                # reads as one size — and a thing that looks pressable has to
+                # be pressable. It acts on the row under the cursor, which is
+                # the only row a click on it could unambiguously mean.
+                yield Button("space  Toggle", id="merge-toggle")
                 yield Cell(self._paint_keep, id="merge-keep")
             yield Cell(self._paint_footnote, id="merge-footnote")
 
     def on_mount(self) -> None:
+        # Nothing on this screen may take focus. A focused Button would answer
+        # `enter` with its own binding, so a click on Toggle would leave the
+        # next `enter` pressing Toggle again instead of merging.
+        for button in self.query(Button):
+            button.can_focus = False
         self._sync()
         # The first fit has to wait for the children to have a real size.
         self.call_after_refresh(self._fit)
@@ -371,12 +380,6 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
             f"same name in all {len(self.candidates)}"
         )
 
-    def _paint_toggle(self) -> Text:
-        line = Text()
-        line.append("space ", style=theme.S_MUTED)
-        line.append("Toggle", style=theme.style("strong"))
-        return line
-
     def _paint_keep(self) -> Text:
         line = Text()
         line.append("esc ", style=theme.S_MUTED)
@@ -444,7 +447,10 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
-        self.action_merge()
+        if event.button.id == "merge-toggle":
+            self.action_toggle()
+        else:
+            self.action_merge()
 
 
 class TaskPrompt(FollowsTerminal, App[str]):
