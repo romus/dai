@@ -12,7 +12,18 @@ from dai.models import Access, AgentEvent, TurnResult, Usage
 #: Pause between the events one turn emits. Nothing in the debate loop sleeps,
 #: so an unpaced fake run is over before Textual draws a single frame — and a
 #: screen you cannot watch is the one thing this whole module exists to avoid.
-BEAT = 0.06
+#: Drawn is not the same as read, though: a beat fast enough to animate still
+#: puts a whole argument past the eye in a couple of seconds, so this is set to
+#: reading speed rather than to the lowest value that produces motion.
+BEAT = 0.45
+
+#: The gap before a turn starts talking, as a multiple of `BEAT`. A round's
+#: verdict is logged the instant the turn that earned it returns, and the next
+#: agent would otherwise start over the top of it — this is the only moment in
+#: which the thing just decided can be read. A multiple rather than a constant
+#: of its own so `beat = 0` still silences every pause in here, which is the
+#: contract the tests run under.
+LEAD_IN = 3.0
 
 
 class FakeEngine(Engine):
@@ -103,11 +114,20 @@ class FakeEngine(Engine):
         and sticks to what the pane will actually draw.
         """
 
+        await self._breathe(self.beat * LEAD_IN)
         for event in _CRITIC_CHATTER if critiquing else _SOLVER_CHATTER:
             if on_event is not None:
                 on_event(event)
-            if self.beat:
-                await asyncio.sleep(self.beat)
+            # A filename and a sentence are not the same amount of reading, and
+            # one beat for both makes the sentences — the lines carrying the
+            # actual argument — the ones you miss.
+            await self._breathe(self.beat * (2.0 if event.kind == "text" else 1.0))
+
+    async def _breathe(self, seconds: float) -> None:
+        # Guarded rather than slept through: a zero-length sleep still yields to
+        # the loop, which is a frame of nothing per event in the headless tests.
+        if seconds:
+            await asyncio.sleep(seconds)
 
 
 def _say(kind: str, text: str, detail: str = "") -> AgentEvent:
