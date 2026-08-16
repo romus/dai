@@ -28,11 +28,6 @@ from dai.snapshot import (
 )
 from dai.transcript import Transcript, list_runs, new_run_id
 
-try:  # stripped from the wheel — present only in a dev install
-    from dai import dev
-except ImportError:  # pragma: no cover - released builds have no dev module
-    dev = None  # type: ignore[assignment]
-
 EXIT_OK = 0
 EXIT_DISAGREED = 1
 EXIT_ERROR = 2
@@ -99,11 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--snapshots", action="store_true", help="list the branches dai committed to"
     )
     parser.add_argument("--show", metavar="RUN_ID", help="print a past run's report")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="watch a canned run — no agents, no tokens, nothing written",
+    )
     parser.add_argument("--version", action="version", version=f"dai {__version__}")
-    # Last, and only when the module is there: a released build's --help is
-    # exactly what it was before any of this existed.
-    if dev is not None:
-        dev.add_arguments(parser)
     return parser
 
 
@@ -111,8 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cwd = (args.cwd or Path.cwd()).resolve()
 
-    if dev is not None and (code := dev.handle(args)) is not None:
-        return code
+    if args.demo:
+        # Before the engines are built, so it runs with neither CLI installed —
+        # which is the state of the user most likely to want it.
+        from dai import demo
+
+        return demo.run(cwd, appearance=_appearance(args.theme or "auto"))
     if args.init:
         path, added = config_module.ensure_config(args.config)
         print(f"config: {path}")
@@ -161,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if missing := _missing_binaries(solver, critic):
         print(f"dai: not found on PATH: {', '.join(missing)}", file=sys.stderr)
+        # This is the moment a user has nothing to run and has just typed out a
+        # task for nothing, so it is the moment to mention the one mode that
+        # needs neither CLI.
+        print("dai: `dai --demo` shows you a run without them", file=sys.stderr)
         return EXIT_ERROR
 
     run_id = new_run_id()

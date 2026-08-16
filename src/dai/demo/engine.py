@@ -40,8 +40,6 @@ class FakeEngine(Engine):
         self.solves: list[dict] = []
         self.critiques: list[dict] = []
         self.beat = BEAT
-        #: What a solve turn writes, so the snapshotter has real work to commit.
-        self.writes: dict[str, str] = {}
         self._turn = 0
 
     def build_argv(  # pragma: no cover - nothing is ever spawned
@@ -99,27 +97,17 @@ class FakeEngine(Engine):
     async def _perform(self, critiquing, cwd, access, on_event) -> None:
         """Say something, slowly enough to be read.
 
-        `AgentPane` buffers streamed text until a newline and renders only
-        four kinds of event, so this emits whole lines and sticks to what the
-        pane will actually draw.
+        Nothing here writes, and nothing here reads either — a turn is its
+        commentary and nothing else. `AgentPane` buffers streamed text until a
+        newline and renders only four kinds of event, so this emits whole lines
+        and sticks to what the pane will actually draw.
         """
 
-        lines = _CRITIC_CHATTER if critiquing else _SOLVER_CHATTER
-        for event in lines:
+        for event in _CRITIC_CHATTER if critiquing else _SOLVER_CHATTER:
             if on_event is not None:
                 on_event(event)
             if self.beat:
                 await asyncio.sleep(self.beat)
-
-        if critiquing or access is not Access.WRITE or cwd is None:
-            return
-        # A solve turn has to leave something behind, or every repository is
-        # unchanged, nothing is committed, and the merge dialog never opens.
-        for name, text in self.writes.items():
-            target = Path(cwd) / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(text)
 
 
 def _say(kind: str, text: str, detail: str = "") -> AgentEvent:
@@ -128,14 +116,16 @@ def _say(kind: str, text: str, detail: str = "") -> AgentEvent:
 
 _SOLVER_CHATTER = [
     _say("thinking", "reading the task and the tree"),
-    _say("tool", "Read", "notes.md"),
-    _say("text", "The table has three empty cells; the README has the answers.\n"),
-    _say("tool", "Edit", "notes.md"),
+    _say("tool", "Read", "README.md"),
+    _say("tool", "Read", "matrix.md"),
+    _say("text", "The table has empty cells; the README has the answers.\n"),
+    _say("tool", "Edit", "matrix.md"),
     _say("text", "Filled them in and left the formatting alone.\n"),
 ]
 
 _CRITIC_CHATTER = [
     _say("thinking", "opening what the solver says it changed"),
-    _say("tool", "Read", "notes.md"),
+    _say("tool", "Read", "matrix.md"),
+    _say("tool", "Read", "README.md"),
     _say("text", "Checked each cell against the source of truth.\n"),
 ]

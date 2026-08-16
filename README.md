@@ -21,9 +21,10 @@ rounds or budget run out.
 
 ```bash
 make install        # create the venv, install deps
+make demo           # watch a run without installing the agents or spending anything
 make doctor         # check uv / claude / codex are actually installed
 make init           # write ~/.config/dai/config.toml (annotated)
-make test           # 351 tests
+make test
 
 make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 ```
@@ -52,11 +53,19 @@ dai --no-merge "bring the changelog up to date"   # leave it on the run's branch
 dai --branch-from current "tidy up the tests"     # branch off where I am, not the trunk
 dai --runs                                        # past runs; --show <id> prints one
 dai --snapshots                                   # branches those runs committed to
+dai --demo                                        # watch a canned run; costs and changes nothing
 ```
 
 From this checkout instead: `make run-here DIR=~/projects/foo ARGS="'the task'"` or
 `uv run dai -C ~/projects/foo "the task"` — every `run` target takes `ARGS`, quoted so
 the task stays one argument.
+
+`dai --demo` plays a canned argument through the real screen: the panes stream, the
+verdicts land, the keys all work, and it ends at the merge dialog for you to answer. The
+agents are invented and so are the repositories, so it needs neither `claude` nor `codex`
+installed, spends nothing, and **writes nothing at all** — no files, no commits, no
+transcript. It is the cheapest way to see what a run looks like, and the only way to see
+the merge dialog refuse a repository.
 
 In a repository you care about, start with `--dry-run`: both agents go read-only and
 you get their proposals instead. `make smoke` runs a real argument in a throwaway
