@@ -5,12 +5,26 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 
 from dai.budget import Limits, Pricing
 from dai.protocol import RIGOR, STANDARD
 
 APP = "dai"
+
+
+class Merge(StrEnum):
+    """What consensus does with the run's branch.
+
+    A `StrEnum` rather than three constants so that `Merge.ASK == "ask"` and the
+    setting can be compared against what the TOML file literally says, in both
+    directions, without a translation table anybody could forget to extend.
+    """
+
+    NEVER = "never"
+    ASK = "ask"
+    ALWAYS = "always"
 
 
 @dataclass
@@ -34,7 +48,10 @@ class SnapshotConfig:
     #: What the run's branch is rooted on — and so what it merges back into.
     #: "default" finds the trunk, "current" stays where you are, or name one.
     branch_from: str = "default"
-    merge: bool = True
+    #: Deliberately not a bool any more, and deliberately `ask` by default: the
+    #: merge writes to a branch of the user's, and the honest default is the one
+    #: that cannot do that without being told to.
+    merge: Merge = Merge.ASK
     ignore: list[str] = field(
         default_factory=lambda: ["node_modules", ".venv", "venv", "target", "dist", "build"]
     )
@@ -164,11 +181,18 @@ branch_from = "default"
 
 # On consensus, fast-forward that base branch onto the run's work and leave you
 # standing on it, so `git status` is clean and `git log` reads as the work
-# having simply been done. Turn this off to be left on dai/<run-id> instead,
-# with the work committed there and yours to merge by hand. A repo whose base
-# branch moved during the run is refused, with the reason printed, and stays on
-# dai/<run-id>. Only consensus merges: a deadlock or a run you killed never does.
-merge = true
+# having simply been done.
+#   true    — merge, without asking
+#   false   — never merge; you are left on dai/<run-id>, the work committed
+#             there and yours to merge by hand
+#   "ask"   — you are shown what each repo would write, and pick which of them
+#             go; in the TUI that is a list you tick, and on a plain terminal
+#             a y/N question. Piped or redirected, with nobody to ask, nothing
+#             is merged.
+# A repo whose base branch moved during the run is refused whatever this says,
+# with the reason printed, and stays on dai/<run-id>. Only consensus merges: a
+# deadlock or a run you killed never does.
+merge = "ask"
 
 ignore = ["node_modules", ".venv", "venv", "target", "dist", "build"]
 
@@ -367,7 +391,7 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
             scan_depth=int(snap.get("scan_depth", 3)),
             branch_prefix=str(snap.get("branch_prefix", "dai/")),
             branch_from=str(snap.get("branch_from", "default") or "default"),
-            merge=bool(snap.get("merge", True)),
+            merge=_merge(snap),
             ignore=_strings(snap.get("ignore"), SnapshotConfig().ignore),
         ),
         engines=engines,
@@ -381,6 +405,20 @@ def _rigor(critique: dict) -> str:
     # harshness, not the run.
     value = str(critique.get("rigor", STANDARD)).strip().lower()
     return value if value in RIGOR else STANDARD
+
+
+def _merge(snap: dict) -> Merge:
+    # A bool is the older spelling of this setting and still an honest one, so
+    # a config written before there was a third answer keeps its own: true is
+    # "always", false is "never". Anything nobody recognises means "ask" — a
+    # typo should cost the run its automation, not a branch of yours.
+    value = snap.get("merge", Merge.ASK)
+    if isinstance(value, bool):
+        return Merge.ALWAYS if value else Merge.NEVER
+    text = str(value).strip().lower()
+    if spelled := {"true": Merge.ALWAYS, "false": Merge.NEVER}.get(text):
+        return spelled
+    return Merge(text) if text in tuple(Merge) else Merge.ASK
 
 
 def _theme(tui: dict) -> str:

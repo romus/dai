@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from dai.__main__ import _apply_overrides, _relative, build_parser
-from dai.config import DEFAULT_CONFIG_TEXT, ensure_config, from_dict, load
+from dai.config import DEFAULT_CONFIG_TEXT, Merge, ensure_config, from_dict, load
 
 
 def test_defaults_apply_when_there_is_no_config(tmp_path):
@@ -35,7 +35,7 @@ def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tm
     assert cfg.stop_on_minor_only is True
     assert cfg.snapshot.enabled is True
     assert cfg.snapshot.branch_prefix == "dai/"
-    assert cfg.snapshot.merge is True
+    assert cfg.snapshot.merge is Merge.ASK
     assert cfg.snapshot.branch_from == "default"
     assert cfg.engine("claude").critic_args == ["--permission-mode", "plan"]
     assert cfg.engine("codex").critic_args == ["--sandbox", "read-only"]
@@ -69,7 +69,7 @@ def test_a_config_written_before_a_setting_existed_gets_it_added(tmp_path):
 
     assert "snapshot.merge" in added
     assert "snapshot.branch_from" in added
-    assert cfg.snapshot.merge is True
+    assert cfg.snapshot.merge is Merge.ASK
     assert cfg.snapshot.enabled is True
     assert cfg.solver == "codex"  # yours, untouched
     assert "# how it used to work" in path.read_text()  # and so are your comments
@@ -94,7 +94,9 @@ def test_a_setting_you_already_have_is_not_added_twice(tmp_path):
     _, added = ensure_config(path)
 
     assert "snapshot.merge" not in added
-    assert load(path).snapshot.merge is False
+    # The value you set survives, in the spelling you set it in: a config from
+    # before there was a third answer is not quietly given one.
+    assert load(path).snapshot.merge is Merge.NEVER
 
 
 def test_a_missing_section_is_added_whole(tmp_path):
@@ -136,8 +138,28 @@ def test_the_run_branch_can_be_named_something_else():
 def test_merging_the_work_back_can_be_switched_off_in_the_config():
     cfg = from_dict({"snapshot": {"merge": False}})
 
-    assert cfg.snapshot.merge is False
+    assert cfg.snapshot.merge is Merge.NEVER
     assert cfg.snapshot.enabled is True  # untouched keys keep their defaults
+
+
+def test_the_older_boolean_spelling_of_merge_still_says_what_it_used_to():
+    """A config written when this was a bool must not change meaning under it."""
+
+    assert from_dict({"snapshot": {"merge": True}}).snapshot.merge is Merge.ALWAYS
+    assert from_dict({"snapshot": {"merge": False}}).snapshot.merge is Merge.NEVER
+
+
+def test_merge_can_defer_to_you():
+    assert from_dict({"snapshot": {"merge": "ask"}}).snapshot.merge is Merge.ASK
+    assert from_dict({"snapshot": {"merge": "always"}}).snapshot.merge is Merge.ALWAYS
+    assert from_dict({"snapshot": {"merge": "never"}}).snapshot.merge is Merge.NEVER
+
+
+def test_a_merge_setting_nobody_recognises_asks_rather_than_guessing():
+    """A typo must not decide on its own to write to a branch of yours."""
+
+    assert from_dict({"snapshot": {"merge": "maybe"}}).snapshot.merge is Merge.ASK
+    assert from_dict({"snapshot": {}}).snapshot.merge is Merge.ASK
 
 
 def test_the_branch_can_be_rooted_somewhere_other_than_the_trunk():

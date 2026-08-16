@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from pathlib import Path
 
 from rich.text import Text
@@ -14,15 +15,16 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static
 from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
+from dai.config import Merge
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
-from dai.snapshot import Snapshotter, describe
+from dai.snapshot import MergeCandidate, Snapshotter, describe, merge_promise
 from dai.transcript import Transcript
 from dai.tui import theme
 from dai.tui.appearance import AppearanceChanged, driver_class
 from dai.tui.completion import DEFAULT_DEBOUNCE_MS, CompletingInput
-from dai.tui.theme import apply_theme, hint
-from dai.tui.widgets import AgentPane, StatusBar, VerdictLog
+from dai.tui.theme import apply_theme, hint, spaced
+from dai.tui.widgets import AgentPane, Cell, RepoRow, StatusBar, VerdictLog
 
 #: How each ending is announced. Style names, not style strings — the palette
 #: they resolve against is whichever the terminal is wearing at the time.
@@ -193,6 +195,215 @@ class ConfirmQuitScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class _RowList(VerticalScroll, can_focus=False, inherit_bindings=False):
+    """The merge screen's rows: scrollable, but never focusable.
+
+    Both halves matter. A focusable `VerticalScroll` binds up and down to its
+    own scrolling, so one `tab` would take the cursor keys away from the
+    screen — and there is nothing here to focus *for*, since the rows are not
+    something you land on. The screen tracks the cursor itself.
+    """
+
+
+class MergeScreen(ModalScreen[tuple[Path, ...]]):
+    """At the end of an agreed run: which repositories go home.
+
+    Does no git. It is handed rows worked out before it opened and hands back
+    the paths that were ticked, which is what makes "nothing is written until
+    you choose" a fact about the code rather than a line in a footer.
+    """
+
+    #: Nothing here is focusable, on purpose — see BINDINGS.
+    AUTO_FOCUS = ""
+
+    BINDINGS = [
+        Binding("up,k", "cursor(-1)", "up", show=False),
+        Binding("down,j", "cursor(1)", "down", show=False),
+        Binding("space", "toggle", "toggle"),
+        Binding("enter", "merge", "merge"),
+        # `q` is named here so that it is *consumed*. The app's own q is a kill
+        # switch, and the thing it would kill is the worker awaiting this very
+        # screen. A modal truncates the binding chain, so this is belt and
+        # braces rather than the only guard — but it is the one that says so.
+        Binding("escape,q", "keep", "keep the branches"),
+    ]
+
+    def __init__(
+        self,
+        candidates: Sequence[MergeCandidate],
+        *,
+        run_branch: str,
+        outcome: str = "AGREED",
+    ) -> None:
+        super().__init__()
+        self.candidates = tuple(candidates)
+        self.run_branch = run_branch
+        self.outcome = outcome
+        # Everything that can go starts ticked: asking must default to the
+        # answer `merge = true` would have given, so enter is one keystroke.
+        self._selected = {row.repo for row in self.candidates if row.mergeable}
+        self._cursor = next(
+            (i for i, row in enumerate(self.candidates) if row.mergeable), 0
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Cell(self._paint_outcome, id="merge-outcome")
+            yield Cell(self._paint_title, id="merge-title")
+            yield Cell(self._paint_lede, id="merge-lede")
+            yield Cell(self._paint_from, id="merge-from")
+            with _RowList(id="merge-rows"):
+                for index, candidate in enumerate(self.candidates):
+                    yield RepoRow(
+                        candidate, run_branch=self.run_branch, id=f"merge-row-{index}"
+                    )
+            with Horizontal(id="merge-actions"):
+                yield Button(self._merge_label(), variant="primary", id="merge-go")
+                yield Cell(self._paint_toggle, id="merge-toggle")
+                yield Cell(self._paint_keep, id="merge-keep")
+            yield Cell(self._paint_footnote, id="merge-footnote")
+
+    def on_mount(self) -> None:
+        self._sync()
+
+    def repaint(self) -> None:
+        """Draw every line again, in whichever palette is active now.
+
+        Deliberately not `recompose`, which `DeadlockScreen` can afford and
+        this cannot: it would rebuild the rows and take the cursor, the ticks
+        and the scroll position with them. Nothing here holds a baked colour —
+        the header paints from callbacks and the rows from `render()` — so
+        asking each to draw again is the whole job. The tint, the hairlines and
+        the card are `$dai-*` in the sheet, and were swapped before we ran.
+        """
+
+        for cell in self.query(Cell):
+            cell.refresh()
+        for row in self.query(RepoRow):
+            row.refresh()
+
+    # --- what it says -----------------------------------------------------
+
+    def _paint_outcome(self) -> Text:
+        color = theme.color("success")
+        line = Text()
+        line.append("● ", style=color)
+        line.append(spaced(self.outcome), style=f"bold {color}")
+        return line
+
+    def _paint_title(self) -> Text:
+        count = len(self.candidates)
+        title = (
+            "1 repository changed. Merge it?"
+            if count == 1
+            else f"{count} repositories changed. Merge which?"
+        )
+        return Text(title, style=theme.style("strong"))
+
+    def _paint_lede(self) -> Text:
+        return Text(
+            "Each merges into the branch it was taken from.", style=theme.S_MUTED
+        )
+
+    def _paint_from(self) -> Text:
+        line = Text()
+        line.append(f"{spaced('FROM')}  ", style=theme.S_MUTED)
+        line.append(self.run_branch, style=theme.S_TEXT)
+        if tail := self._branch_tail():
+            line.append(f"  ·  {tail}", style=theme.S_MUTED)
+        return line
+
+    def _branch_tail(self) -> str:
+        """`· same name in all 3` — but only when it is true.
+
+        A repository whose git would not take a slashed name took a flat one,
+        and then the headline is not the whole story; those rows say their own
+        branch instead, so this says nothing rather than something wrong.
+        """
+
+        names = {row.branch for row in self.candidates}
+        if len(self.candidates) < 2 or names != {self.run_branch}:
+            return ""
+        return "same name in both" if len(self.candidates) == 2 else (
+            f"same name in all {len(self.candidates)}"
+        )
+
+    def _paint_toggle(self) -> Text:
+        line = Text()
+        line.append("space ", style=theme.S_MUTED)
+        line.append("Toggle", style=theme.style("strong"))
+        return line
+
+    def _paint_keep(self) -> Text:
+        line = Text()
+        line.append("esc ", style=theme.S_MUTED)
+        line.append("Keep the branches", style=theme.style("strong"))
+        return line
+
+    def _paint_footnote(self) -> Text:
+        return Text(
+            "Nothing is written until you choose. Every branch stays either way.",
+            style=theme.S_MUTED,
+        )
+
+    def _merge_label(self) -> str:
+        return f"↵  Merge {len(self._selected)} selected"
+
+    # --- what it does -----------------------------------------------------
+
+    def action_cursor(self, delta: int) -> None:
+        if not self.candidates:
+            return
+        self._cursor = (self._cursor + delta) % len(self.candidates)
+        self._sync()
+        self.query_one(f"#merge-row-{self._cursor}", RepoRow).scroll_visible(
+            animate=False
+        )
+
+    def action_toggle(self) -> None:
+        if not self.candidates:
+            return
+        row = self.candidates[self._cursor]
+        # The cursor may rest on a row that cannot go — its reason is the whole
+        # point of showing it — but space there is inert rather than a lie.
+        if not row.mergeable:
+            return
+        self._selected ^= {row.repo}
+        self._sync()
+
+    def action_merge(self) -> None:
+        # Guarded on the count, not on the button: enter has to be inert when
+        # there is nothing to merge whether or not a button happens to exist.
+        if not self._selected:
+            return
+        self.dismiss(
+            tuple(row.repo for row in self.candidates if row.repo in self._selected)
+        )
+
+    def action_keep(self) -> None:
+        self.dismiss(())
+
+    def _sync(self) -> None:
+        """Push the screen's two facts — cursor and ticks — onto the widgets."""
+
+        for index, row in enumerate(self.query(RepoRow)):
+            row.selected = row.candidate.repo in self._selected
+            row.at_cursor = index == self._cursor
+        button = self.query_one("#merge-go", Button)
+        button.label = self._merge_label()
+        button.disabled = not self._selected
+
+    def on_repo_row_picked(self, event: RepoRow.Picked) -> None:
+        event.stop()
+        self._cursor = list(self.query(RepoRow)).index(event.row)
+        self.action_toggle()
+        self._sync()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.action_merge()
+
+
 class TaskPrompt(FollowsTerminal, App[str]):
     """Asks what to do, when `dai` is started without a task."""
 
@@ -349,9 +560,7 @@ class DaiApp(FollowsTerminal, App):
             note = (
                 f"any of {len(self.snapshotter.repos)} repo(s) that changes moves "
                 f"→ {self.snapshotter.branch}, a commit per round"
-            )
-            if self.snapshotter.settings.merge:
-                note += " · merged back if they agree"
+            ) + merge_promise(self.snapshotter.settings.merge)
             verdicts.note(note)
 
         self.debate.on_event = self._on_debate_event
@@ -388,8 +597,8 @@ class DaiApp(FollowsTerminal, App):
                 f"{self.result.outcome.value}: {self.result.reason}",
             )
             self.transcript.snapshots(report)
-            if self.snapshotter.settings.merge and self.result.agreed:
-                await asyncio.to_thread(self.snapshotter.merge)
+            if self.result.agreed and self.snapshotter.settings.merge is not Merge.NEVER:
+                await self._settle_merge()
 
         path = self.transcript.finish(
             self.result,
@@ -496,6 +705,42 @@ class DaiApp(FollowsTerminal, App):
             f"you chose: {choice} wins", style="strong"
         )
         return choice or self.debate.deadlock_policy
+
+    async def _settle_merge(self) -> None:
+        """Decide what goes home, and move it. Only ever reached on agreement.
+
+        Sits between the final commit and the transcript on purpose: after the
+        commit, so the rows it shows are the real ones; before the record, so
+        the report can state what actually happened rather than what the config
+        intended.
+        """
+
+        if self.snapshotter.settings.merge is Merge.ALWAYS:
+            await asyncio.to_thread(self.snapshotter.merge)
+            return
+
+        rows = await asyncio.to_thread(self.snapshotter.preview)
+        if not rows:
+            return
+
+        self.query_one(StatusBar).set_phase("waiting for you")
+        assert self.result is not None
+        label, _ = _OUTCOME_STYLE[self.result.outcome]
+        # `or ()` for the same reason `_on_deadlock` has its fallback: a screen
+        # dismissed by anything other than its own two exits answers nothing,
+        # and nothing must read as "keep the branches", never as consent.
+        chosen = await self.push_screen_wait(
+            MergeScreen(rows, run_branch=self.snapshotter.branch, outcome=label)
+        ) or ()
+        self.query_one(VerdictLog).note(
+            f"you chose: merge {len(chosen)} of {len(rows)}"
+            if chosen
+            else "you chose: keep the branches",
+            style="strong",
+        )
+        await asyncio.to_thread(
+            self.snapshotter.merge, only=chosen, kept="you kept the branch"
+        )
 
     # --- actions ----------------------------------------------------------
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dai.__main__ import _apply_overrides, build_parser
 from dai.budget import Spend
-from dai.config import from_dict
+from dai.config import Merge, from_dict
 from dai.models import (
     Action,
     CriticTurn,
@@ -314,18 +314,39 @@ def test_snapshots_are_on_by_default():
     assert cfg.snapshot.enabled is True
 
 
-def test_merging_back_is_on_by_default():
+def test_merging_back_defaults_to_asking_you():
     args = build_parser().parse_args(["t"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge is True
+    assert cfg.snapshot.merge is Merge.ASK
 
 
 def test_the_no_merge_flag_leaves_you_on_the_runs_branch():
     args = build_parser().parse_args(["t", "--no-merge"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge is False
+    assert cfg.snapshot.merge is Merge.NEVER
+
+
+def test_the_merge_flag_skips_the_question():
+    args = build_parser().parse_args(["t", "--merge"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.merge is Merge.ALWAYS
+
+
+def test_the_ask_merge_flag_beats_a_config_that_had_made_up_its_mind():
+    args = build_parser().parse_args(["t", "--ask-merge"])
+    cfg = _apply_overrides(from_dict({"snapshot": {"merge": True}}), args)
+
+    assert cfg.snapshot.merge is Merge.ASK
+
+
+def test_the_more_cautious_merge_flag_wins_if_you_give_two():
+    args = build_parser().parse_args(["t", "--merge", "--ask-merge", "--no-merge"])
+    cfg = _apply_overrides(from_dict({}), args)
+
+    assert cfg.snapshot.merge is Merge.NEVER
 
 
 def test_the_branch_root_can_be_named_on_the_command_line():
@@ -341,7 +362,7 @@ def test_a_dry_run_cannot_merge_anything():
     args = build_parser().parse_args(["t", "--dry-run", "--merge"])
     cfg = _apply_overrides(from_dict({}), args)
 
-    assert cfg.snapshot.merge is False
+    assert cfg.snapshot.merge is Merge.NEVER
 
 
 def test_the_branches_are_recorded_in_the_event_log(tmp_path):

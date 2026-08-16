@@ -10,20 +10,27 @@ import pytest
 
 from dai.budget import Budget, Limits
 from dai.consensus import Referee
-from dai.config import SnapshotConfig
+from dai.config import Merge, SnapshotConfig
 from dai.models import AgentEvent, Outcome, Role, Severity, Issue
 from dai.orchestrator import Debate, DebateResult
-from dai.snapshot import Snapshotter, ignore_locally
+from dai.snapshot import MergeCandidate, Snapshotter, ignore_locally
 from dai.transcript import Transcript
+from rich.console import Console
 from textual.app import App
 from textual.color import Color, ColorParseError
 from textual.widgets import Button, Label, RichLog, Static
 
 from dai.tui import theme
-from dai.tui.app import ConfirmQuitScreen, DaiApp, DeadlockScreen, InjectScreen
+from dai.tui.app import (
+    ConfirmQuitScreen,
+    DaiApp,
+    DeadlockScreen,
+    InjectScreen,
+    MergeScreen,
+)
 from dai.tui.appearance import AppearanceChanged
 from dai.tui.theme import apply_theme
-from dai.tui.widgets import AgentPane, StatusBar, VerdictLog
+from dai.tui.widgets import AgentPane, Cell, RepoRow, StatusBar, VerdictLog
 from test_orchestrator import Scripted, approve, changes, replies, solved
 
 
@@ -351,7 +358,7 @@ async def test_the_kill_switch_never_merges_the_work(tmp_path):
 
     repo = make_repo(tmp_path)
     ignore_locally(repo, ".dai/")  # as the real entry point does, before anything writes
-    snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge=True))
+    snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge=Merge.ALWAYS))
     snapshotter.observe()  # the round-1 gate, before any agent moves
     (repo / "a.txt").write_text("the agents got this far\n")
     solver = Hanging("solver-engine", [])
@@ -482,6 +489,215 @@ async def test_a_real_deadlock_pauses_for_the_user(tmp_path):
 
         assert app.result is not None
         assert "solver's version stands" in app.result.reason
+
+
+# --- the merge screen -----------------------------------------------------
+
+
+def agreed_run(tmp_path, merge=Merge.ASK, repos=("proj",)):
+    """A run that agrees, over real repositories the agents really changed."""
+
+    for name in repos:
+        make_repo(tmp_path / name)
+    ignore_locally(tmp_path / repos[0], ".dai/")
+    snapshotter = Snapshotter(tmp_path, "run1", SnapshotConfig(merge=merge))
+    snapshotter.observe()  # the round-1 gate, before any agent moves
+    for name in repos:
+        (tmp_path / name / "a.txt").write_text("the agents did this\n")
+    app, _ = make_app(
+        tmp_path, [solved()], [approve()], snapshotter=snapshotter
+    )
+    return app, snapshotter
+
+
+async def reach_the_question(app, pilot):
+    await wait_for(lambda: isinstance(app.screen, MergeScreen))
+    assert isinstance(app.screen, MergeScreen), "the user was never asked"
+    return app.screen
+
+
+def drawn(widget, width: int = 90) -> str:
+    """What a widget actually puts on the screen, as plain text.
+
+    A `RepoRow` renders a Rich grid, and the right-aligned half of it only
+    exists once something has measured it against a width — so asserting on
+    the renderable itself would assert on a repr.
+    """
+
+    console = Console(width=width, no_color=True, legacy_windows=False)
+    with console.capture() as captured:
+        console.print(widget.render(), end="")
+    return captured.get()
+
+
+async def test_agreeing_asks_which_repositories_to_merge(tmp_path):
+    """`merge = "ask"` must reach the screen, not decide on its own."""
+
+    app, snapshotter = agreed_run(tmp_path, repos=("one", "two"))
+
+    async with app.run_test() as pilot:
+        screen = await reach_the_question(app, pilot)
+
+        assert len(screen.query(RepoRow)) == 2
+        # The question is on screen and nothing has been written yet.
+        assert not any(entry.merged for entry in snapshotter.summary())
+
+        await pilot.press("enter")
+        await wait_for(lambda: app._settled)
+
+    assert [entry.merged for entry in snapshotter.summary()] == [True, True]
+
+
+async def test_keeping_the_branches_writes_nothing_and_says_so(tmp_path):
+    app, snapshotter = agreed_run(tmp_path)
+    repo = tmp_path / "proj"
+    before = git_out("rev-parse", "main", cwd=repo)
+
+    async with app.run_test() as pilot:
+        await reach_the_question(app, pilot)
+        await pilot.press("escape")
+        await wait_for(lambda: app._settled)
+
+    entry = snapshotter.summary()[0]
+
+    assert entry.merged is False
+    assert entry.note == "you kept the branch"
+    assert git_out("rev-parse", "main", cwd=repo) == before
+    assert git_out("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
+    assert git_out("rev-parse", "dai/run1", cwd=repo) != before  # the work is there
+
+
+async def test_unticking_a_repository_leaves_that_one_alone(tmp_path):
+    app, snapshotter = agreed_run(tmp_path, repos=("one", "two"))
+
+    async with app.run_test() as pilot:
+        await reach_the_question(app, pilot)
+        await pilot.press("space")  # untick the row the cursor starts on
+        await pilot.press("enter")
+        await wait_for(lambda: app._settled)
+
+    rows = {entry.repo.name: entry for entry in snapshotter.summary()}
+
+    assert rows["one"].merged is False
+    assert rows["one"].note == "you kept the branch"
+    assert rows["two"].merged is True
+
+
+async def test_a_branch_that_moves_while_you_decide_is_still_refused(tmp_path):
+    """Saying yes is permission, not proof: the check runs again at write time.
+
+    The question can sit there for as long as you take, and the world does not
+    stop while it does.
+    """
+
+    app, snapshotter = agreed_run(tmp_path)
+    repo = tmp_path / "proj"
+
+    async with app.run_test() as pilot:
+        screen = await reach_the_question(app, pilot)
+        assert all(row.candidate.mergeable for row in screen.query(RepoRow))
+
+        # Somebody lands a commit on main while the question is on screen.
+        git_out("commit", "-q", "--allow-empty", "-m", "meanwhile", cwd=repo)
+        git_out("update-ref", "refs/heads/main", "HEAD", cwd=repo)
+        await pilot.press("enter")
+        await wait_for(lambda: app._settled)
+
+    entry = snapshotter.summary()[0]
+
+    assert entry.merged is False
+    assert entry.note and entry.note != "you kept the branch"
+    assert git_out("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
+
+
+async def test_a_dead_row_is_never_counted_in_the_button(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    rows = [
+        MergeCandidate(
+            repo=tmp_path / "one", label="one", branch="dai/run1",
+            base_branch="main", added=3, removed=1, files=("a.txt",),
+        ),
+        MergeCandidate(
+            repo=tmp_path / "two", label="two", branch="dai/run1",
+            base_branch="main", added=4, files=("b.txt",),
+            refusal="b.txt was edited on main too",
+        ),
+    ]
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = MergeScreen(rows, run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert "Merge 1 selected" in str(screen.query_one("#merge-go", Button).label)
+
+        screen._cursor = 1  # park on the row that cannot go
+        screen.action_toggle()
+        await pilot.pause()
+
+        assert "Merge 1 selected" in str(screen.query_one("#merge-go", Button).label)
+        assert screen._selected == {tmp_path / "one"}
+        assert "merge by hand" in drawn(list(screen.query(RepoRow))[1])
+
+
+async def test_the_question_shows_what_would_be_written(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    rows = [
+        MergeCandidate(
+            repo=tmp_path / "one", label=".", branch="dai/run1", base_branch="main",
+            added=318, removed=41, files=("index.html", "primes.html"),
+        )
+    ]
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = MergeScreen(rows, run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        shown = " ".join(drawn(w) for w in screen.query(RepoRow))
+        header = " ".join(str(w.render()) for w in screen.query(Cell))
+
+        assert "index.html" in shown and "primes.html" in shown
+        assert "+318" in shown and "-41" in shown
+        assert ". " in shown and "main" in shown  # the repo, and where it goes
+        assert "1 repository changed. Merge it?" in header
+        assert "dai/run1" in header
+        assert "Nothing is written until you choose" in header
+
+
+async def test_q_on_the_merge_screen_keeps_the_branches_rather_than_killing(tmp_path):
+    """The app's q would cancel the very worker that is awaiting this screen."""
+
+    app, snapshotter = agreed_run(tmp_path)
+
+    async with app.run_test() as pilot:
+        await reach_the_question(app, pilot)
+        await pilot.press("q")
+        await wait_for(lambda: app._settled)
+
+        assert not isinstance(app.screen, ConfirmQuitScreen), "q must not kill here"
+
+    assert app.result is not None
+    assert app.result.outcome is Outcome.CONSENSUS  # not ABORTED
+    assert snapshotter.summary()[0].merged is False
+    assert (tmp_path / ".dai" / "runs" / "run1" / "report.md").is_file()
+
+
+async def test_merging_without_asking_never_shows_the_screen(tmp_path):
+    app, snapshotter = agreed_run(tmp_path, merge=Merge.ALWAYS)
+    seen = []
+
+    async with app.run_test() as pilot:
+        for _ in range(80):
+            seen.append(isinstance(app.screen, MergeScreen))
+            if app._settled:
+                break
+            await asyncio.sleep(0.05)
+
+    assert not any(seen), "told to merge, it asked anyway"
+    assert snapshotter.summary()[0].merged is True
 
 
 # --- layout regression ----------------------------------------------------

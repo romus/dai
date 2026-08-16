@@ -243,7 +243,8 @@ DeadlockScreen .title {
 /* A Horizontal is 1fr tall by default, which stretches an auto-height card
    down the whole screen. The button rows are as tall as their buttons. */
 DeadlockScreen > Vertical > Horizontal,
-ConfirmQuitScreen > Vertical > Horizontal {
+ConfirmQuitScreen > Vertical > Horizontal,
+MergeScreen > Vertical > Horizontal {
     height: auto;
 }
 
@@ -278,4 +279,104 @@ ConfirmQuitScreen .title {
 
 ConfirmQuitScreen Button {
     margin: 1 1 0 0;
+}
+
+/* --- the merge screen -------------------------------------------------- */
+
+MergeScreen {
+    align: center middle;
+}
+
+MergeScreen > Vertical {
+    width: 80%;
+    max-width: 96;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: round $dai-rule;
+}
+
+/* Auto rather than a fixed row: in a narrow terminal these sentences wrap, and
+   a card that grows is better than a sentence that stops mid-word. The card
+   has its own max-height, and the rows below scroll, so nothing runs away. */
+#merge-outcome,
+#merge-title {
+    height: auto;
+}
+
+#merge-title,
+#merge-lede {
+    margin: 1 0 0 0;
+}
+
+#merge-lede {
+    height: auto;
+    color: $dai-muted;
+}
+
+/* The hairline over the list is this line's own bottom border, the way the
+   header and the footer draw theirs — one less widget, and it follows the
+   theme with nothing of ours redrawing it. */
+#merge-from {
+    height: auto;
+    border-bottom: solid $dai-rule;
+}
+
+#merge-rows {
+    height: auto;
+    max-height: 18;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-color: $dai-rule;
+    scrollbar-color-hover: $dai-muted;
+    scrollbar-color-active: $dai-solver;
+}
+
+/* Two lines of content and the gap under them, so the cursor reads as a band
+   rather than a stripe — and so a row can never grow a third line. */
+RepoRow {
+    width: 1fr;
+    height: 3;
+    padding: 0 1;
+}
+
+/* The last row hands its gap to the rule below it. */
+RepoRow:last-of-type {
+    height: 2;
+}
+
+RepoRow.-cursor {
+    background: $dai-highlight;
+}
+
+#merge-actions {
+    border-top: solid $dai-rule;
+}
+
+#merge-go {
+    margin: 0 1 0 0;
+}
+
+/* A keycap, not an action: there is no row a click on it could mean. Bordered
+   and three rows, like the phase pill, so it sits level with the button. */
+#merge-toggle {
+    width: auto;
+    height: 3;
+    padding: 0 1;
+    border: round $dai-rule;
+    content-align: center middle;
+}
+
+#merge-keep {
+    width: 1fr;
+    height: 3;
+    content-align: right middle;
+    text-align: right;
+}
+
+#merge-footnote {
+    height: auto;
+    margin: 1 0 0 0;
+    color: $dai-muted;
 }

@@ -12,9 +12,12 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult, RenderResult
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
+from textual.reactive import reactive
 from textual.widgets import Label, RichLog, Static
 
 from dai.models import AgentEvent, CriticTurn, Severity, Verdict
+from dai.snapshot import MergeCandidate
 from dai.tui import theme
 from dai.tui.theme import spaced
 
@@ -46,7 +49,7 @@ _PHASE_COLOR = {
 }
 
 
-class _Cell(Static):
+class Cell(Static):
     """A slot that paints from a callback.
 
     Rendering late — rather than pushing content in with `update()` — keeps the
@@ -74,9 +77,9 @@ class StatusBar(Horizontal):
         self.spent = 0.0
         self.limit: float | None = None
         self.exact = True
-        self._brand = _Cell(self._render_brand, id="brand")
-        self._progress = _Cell(self._render_progress, id="progress")
-        self._pill = _Cell(self._render_pill, id="phase-pill")
+        self._brand = Cell(self._render_brand, id="brand")
+        self._progress = Cell(self._render_progress, id="progress")
+        self._pill = Cell(self._render_pill, id="phase-pill")
 
     def compose(self) -> ComposeResult:
         yield self._brand
@@ -218,12 +221,12 @@ class AgentPane(Vertical):
             min_width=1,
             classes="pane-log",
         )
-        yield _Cell(self._render_activity, classes="pane-activity")
+        yield Cell(self._render_activity, classes="pane-activity")
 
     def on_mount(self) -> None:
         # Nothing has been said yet, so the placeholder holds the pane.
         self.query_one(".pane-log", RichLog).display = False
-        self.query_one(".pane-activity", _Cell).display = False
+        self.query_one(".pane-activity", Cell).display = False
         # Slow enough to read as a heartbeat rather than a flicker.
         self.set_interval(0.5, self._tick)
 
@@ -248,12 +251,12 @@ class AgentPane(Vertical):
 
         self._activity = text or ""
         self._pulse = bool(text)
-        activity = self.query_one(".pane-activity", _Cell)
+        activity = self.query_one(".pane-activity", Cell)
         activity.display = text is not None
         activity.refresh(layout=True)
 
     def _tick(self) -> None:
-        activity = self.query_one(".pane-activity", _Cell)
+        activity = self.query_one(".pane-activity", Cell)
         if not activity.display:
             return
         self._pulse = not self._pulse
@@ -288,7 +291,7 @@ class AgentPane(Vertical):
             self._draw(line)
         self.query_one(".pane-title", Label).update(self._heading())
         self.query_one(".pane-idle", Static).update(self._idle())
-        self.query_one(".pane-activity", _Cell).refresh()
+        self.query_one(".pane-activity", Cell).refresh()
 
     def note(self, text: str, style: str = "") -> None:
         self._write(_Line("note", text=text, style=style))
@@ -337,6 +340,104 @@ class AgentPane(Vertical):
     def _shorten(self, text: str, width: int = 120) -> str:
         shown = str(text).replace(f"{self.cwd}/", "").replace(str(self.cwd), ".")
         return shown if len(shown) <= width else shown[: width - 1] + "…"
+
+
+class RepoRow(Static):
+    """One repository on the merge screen: what it is, and what changed in it.
+
+    One widget for both of its lines, not two. The cursor tint has to cover the
+    whole row, which makes it the widget's *background* — CSS, and so free
+    across a theme change; and the counts have to sit against the right edge at
+    any width, which makes the content one grid measured against the widget
+    rather than a string padded to a width nobody knows before layout.
+    """
+
+    #: Width of the marker gutter. Line two hangs under the text, not the tick.
+    GUTTER = 4
+
+    #: File names before the tail becomes "+n more".
+    NAMED = 2
+
+    selected: reactive[bool] = reactive(False)
+    at_cursor: reactive[bool] = reactive(False)
+
+    class Picked(Message):
+        """A click landed on this row: put the cursor here and toggle it."""
+
+        def __init__(self, row: RepoRow) -> None:
+            self.row = row
+            super().__init__()
+
+    def __init__(
+        self, candidate: MergeCandidate, *, run_branch: str = "", **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.candidate = candidate
+        self.run_branch = run_branch
+
+    def watch_at_cursor(self, on: bool) -> None:
+        self.set_class(on, "-cursor")
+
+    def render(self) -> RenderResult:
+        item = self.candidate
+        mark = "✓" if self.selected else "·"
+
+        head = Text()
+        head.append(item.label, style=theme.S_TEXT)
+        head.append("  →  ", style=theme.S_MUTED)
+        head.append(item.base_branch or "nothing", style=theme.S_MUTED)
+
+        stats = Text()
+        if item.added:
+            stats.append(f"+{item.added}", style=theme.SUCCESS)
+        if item.removed:
+            stats.append("  " if item.added else "")
+            stats.append(f"-{item.removed}", style=theme.ERROR)
+
+        if item.refusal:
+            detail = Text(
+                f"{item.refusal} — merge by hand", style=theme.style("plain-warning")
+            )
+        else:
+            detail = Text(self._files(), style=theme.S_MUTED)
+
+        # One grid, two rows. The second line shares the first's columns, so
+        # both are cropped in the same place and neither can wrap the row onto
+        # a third line and break the fixed height the cursor tint relies on.
+        grid = Table.grid(expand=True)
+        grid.add_column(width=self.GUTTER, no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        # Without a spacer an ellipsised path butts straight into the counts.
+        grid.add_column(width=2, no_wrap=True)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row(
+            Text(
+                mark.ljust(self.GUTTER),
+                style=theme.SOLVER if self.selected else theme.S_MUTED,
+            ),
+            head,
+            "",
+            stats,
+        )
+        grid.add_row("", detail, "", "")
+        return grid
+
+    def _files(self) -> str:
+        names = self.candidate.files
+        shown = " · ".join(names[: self.NAMED])
+        if (rest := len(names) - self.NAMED) > 0:
+            shown = f"{shown} +{rest} more"
+        # A repository whose git refused the slashed name took a flat one. The
+        # FROM line above cannot then claim they all match, so this one says
+        # which branch it is really on.
+        if self.run_branch and self.candidate.branch != self.run_branch:
+            shown = f"on {self.candidate.branch} · {shown}" if shown else (
+                f"on {self.candidate.branch}"
+            )
+        return shown or "nothing to show"
+
+    def on_click(self) -> None:
+        self.post_message(self.Picked(self))
 
 
 @dataclass(frozen=True)

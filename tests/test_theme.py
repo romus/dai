@@ -57,6 +57,7 @@ def test_each_theme_carries_the_stylesheet_variables():
         assert textual_theme.variables["dai-rule"] == palette.rule
         assert textual_theme.variables["dai-muted"] == palette.muted
         assert textual_theme.variables["dai-solver"] == palette.solver
+        assert textual_theme.variables["dai-highlight"] == palette.highlight
 
 
 # --- nothing may ask for a colour that does not exist ---------------------

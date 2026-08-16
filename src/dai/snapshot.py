@@ -34,11 +34,11 @@ import os
 import shlex
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dai.config import SnapshotConfig
+from dai.config import Merge, SnapshotConfig
 
 #: Directories never worth walking into when looking for repositories.
 ALWAYS_SKIP = {".git", "__pycache__"}
@@ -98,6 +98,37 @@ class RepoResult:
         """The branch you are left on in this repository."""
 
         return self.base_branch if self.merged else self.branch
+
+
+@dataclass(frozen=True)
+class MergeCandidate:
+    """One repository's answer to "what would merging this write, and can it?"
+
+    Everything a prompt prints as it stands: no git, no path arithmetic, no
+    counting. That is the point of it — the question is asked before anything
+    is written, so whoever is drawing it must not be able to write either.
+
+    `repo` is the only field that travels back out, and it is the key the merge
+    is then asked for by.
+    """
+
+    repo: Path
+    #: How a row names it: "." for the workspace itself, else relative to it.
+    label: str
+    #: The branch this repository actually took — possibly the flat fallback.
+    branch: str
+    #: What it would merge into.
+    base_branch: str
+    added: int = 0
+    removed: int = 0
+    #: The changed file names. The renderers show the head and count the rest.
+    files: tuple[str, ...] = ()
+    #: Why this one cannot go. Empty means it can.
+    refusal: str = ""
+
+    @property
+    def mergeable(self) -> bool:
+        return not self.refusal
 
 
 def git(
@@ -248,6 +279,20 @@ def addressed(repo: Path, cwd: Path) -> str:
         where = repo
     # A workspace with a space in its name still has to be pasteable.
     return f"git -C {shlex.quote(str(where))}"
+
+
+def merge_promise(merge: Merge) -> str:
+    """What the pre-run banner promises will happen to the work, if they agree.
+
+    Said before the run rather than discovered after it, which is why "ask"
+    cannot borrow "merged back": a run that is going to stop and ask has not
+    promised anything yet, and saying otherwise is the promise being broken.
+    """
+
+    return {
+        Merge.ALWAYS: " · merged back if they agree",
+        Merge.ASK: " · you choose what to merge if they agree",
+    }.get(merge, "")
 
 
 def describe(repos: Sequence[RepoResult], cwd: Path) -> list[str]:
@@ -501,7 +546,39 @@ class Snapshotter:
 
     # --- adopting the work ------------------------------------------------
 
-    def merge(self) -> list[RepoResult]:
+    def preview(self) -> list[MergeCandidate]:
+        """What each repository is offering to merge, and whether it can.
+
+        Read-only, and that is the whole contract: it is what makes "nothing is
+        written until you choose" a fact about the code rather than a promise
+        in a footer. Whoever asks the question renders these rows and hands
+        back the paths — they never touch git themselves.
+        """
+
+        rows = []
+        for entry in self.summary():
+            try:
+                refusal = self._refusal(entry)
+                added, removed, files = self._diffstat(entry)
+            except (SnapshotError, OSError) as exc:
+                refusal, added, removed, files = str(exc), 0, 0, ()
+            rows.append(
+                MergeCandidate(
+                    repo=entry.repo,
+                    label=self._label(entry.repo),
+                    branch=entry.branch,
+                    base_branch=entry.base_branch,
+                    added=added,
+                    removed=removed,
+                    files=files,
+                    refusal=refusal,
+                )
+            )
+        return rows
+
+    def merge(
+        self, *, only: Collection[Path] | None = None, kept: str = ""
+    ) -> list[RepoResult]:
         """Fast-forward the base branch onto the run's work, and stand on it.
 
         The target is not a separate setting: it is the branch the run was
@@ -512,11 +589,20 @@ class Snapshotter:
         losing the merge is survivable and losing the run's record over it is
         not. A refused repository simply stays on the run's branch, which is
         exactly where the work is.
+
+        `only` narrows it to the repositories somebody picked; `kept` is the
+        note the rest are recorded with. A repository left out is still asked
+        for its refusal first, because one that was passed over because it
+        *could not* go has to say so — "you kept the branch" over the top of a
+        real reason would be the tool putting words in the user's mouth.
         """
 
         for entry in self.summary():
             try:
-                reason = self._merge_one(entry)
+                if only is not None and entry.repo not in only:
+                    reason = self._refusal(entry) or kept
+                else:
+                    reason = self._merge_one(entry)
             except (SnapshotError, OSError) as exc:
                 reason = str(exc)
             self._merged[entry.repo] = (not reason, reason)
@@ -525,10 +611,30 @@ class Snapshotter:
     def _merge_one(self, entry: RepoResult) -> str:
         """Move the base branch onto the run's tip; the reason it did not."""
 
+        if reason := self._refusal(entry):
+            return reason
+
+        repo, target = entry.repo, entry.base_branch
+        git(
+            "update-ref", "-m", f"dai {self.run_id} merge",
+            f"refs/heads/{target}", self._tips[repo], cwd=repo,
+        )
+        # The index and working tree already match the tip, and the target now
+        # points at it — so standing on it rewrites nothing.
+        git("symbolic-ref", "HEAD", f"refs/heads/{target}", cwd=repo)
+        return ""
+
+    def _refusal(self, entry: RepoResult) -> str:
+        """Why this repository cannot be fast-forwarded; empty when it can.
+
+        Separate from the writes it guards so that it can be asked on its own,
+        before anything has happened — which is what lets a prompt show a row
+        it already knows is not going anywhere, and say why.
+        """
+
         repo = entry.repo
-        tip = self._tips.get(repo, "")
         target = entry.base_branch
-        if not tip:
+        if not self._tips.get(repo, ""):
             return "nothing was committed"
         if not target:
             return "there is no branch to merge into"
@@ -544,16 +650,72 @@ class Snapshotter:
         if now != entry.base:
             # Fast-forwarding would drop whatever landed there meanwhile, and
             # rebasing on the user's behalf is not ours to decide.
-            return f"{target} moved while the agents were working"
-
-        git(
-            "update-ref", "-m", f"dai {self.run_id} merge",
-            f"refs/heads/{target}", tip, cwd=repo,
-        )
-        # The index and working tree already match the tip, and the target now
-        # points at it — so standing on it rewrites nothing.
-        git("symbolic-ref", "HEAD", f"refs/heads/{target}", cwd=repo)
+            return self._moved_on(repo, target, entry.base, now)
         return ""
+
+    def _moved_on(self, repo: Path, target: str, base: str, now: str) -> str:
+        """That the branch moved, said in terms of what actually landed on it.
+
+        "main moved while the agents were working" is true and tells you
+        nothing; the file that moved is the thing you need in order to guess
+        whether this is a conflict or a rename you can wave through.
+        """
+
+        landed = [
+            name
+            for name in git(
+                "diff", "--name-only", base, now, cwd=repo, check=False
+            ).splitlines()
+            if name
+        ]
+        if not landed:
+            return f"{target} moved while the agents were working"
+        if len(landed) == 1:
+            return f"{landed[0]} was edited on {target} too"
+        return f"{landed[0]} and {len(landed) - 1} others were edited on {target} too"
+
+    def _diffstat(self, entry: RepoResult) -> tuple[int, int, tuple[str, ...]]:
+        """What merging this repository would write: lines either way, and what.
+
+        The range starts at `base`, not at the run's first round commit, so the
+        `baseline` commit carrying your own work in progress is counted too —
+        because that is exactly what the fast-forward carries onto your branch.
+        Showing less than the merge writes is the one lie not worth telling on
+        a screen whose whole job is to say what is about to happen.
+        """
+
+        # A repository with no history at all has nothing to diff from; the
+        # empty tree is what `_tree_of` already stands in with elsewhere.
+        left = entry.base or self._tree_of(entry.repo, "")
+        if not left:
+            return 0, 0, ()
+
+        added = removed = 0
+        files: list[str] = []
+        listed = git(
+            "diff", "--numstat", left, entry.branch, cwd=entry.repo, check=False
+        )
+        for line in listed.splitlines():
+            plus, _, rest = line.partition("\t")
+            minus, _, name = rest.partition("\t")
+            if not name:
+                continue
+            # A binary file reports "-" in both columns. It still changed, so
+            # it is still named; it simply has no lines to count.
+            added += int(plus) if plus.isdigit() else 0
+            removed += int(minus) if minus.isdigit() else 0
+            files.append(name)
+        return added, removed, tuple(files)
+
+    def _label(self, repo: Path) -> str:
+        """How a prompt names this repository: "." for the one you started in."""
+
+        if repo == self.cwd:
+            return "."
+        try:
+            return str(repo.relative_to(self.cwd))
+        except ValueError:
+            return str(repo)
 
     # --- internals --------------------------------------------------------
 

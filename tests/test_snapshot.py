@@ -657,6 +657,135 @@ def test_merging_moves_the_base_branch_and_leaves_you_on_it(tmp_path):
     assert (repo / "added.txt").read_text() == "new\n"
 
 
+def test_the_preview_says_what_merging_would_write(tmp_path):
+    """The numbers on the screen are the diff, not the agents' own account."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n", repo / "added.txt": "new\n"}, 2)
+    snap.capture_final()
+
+    row = snap.preview()[0]
+
+    assert row.mergeable
+    assert row.label == "."  # the workspace itself
+    assert row.branch == "dai/run1"
+    assert row.base_branch == "main"
+    assert sorted(row.files) == ["a.txt", "added.txt"]
+    assert (row.added, row.removed) == (2, 1)  # a.txt one for one, added.txt new
+
+
+def test_the_preview_counts_the_baseline_because_the_merge_carries_it(tmp_path):
+    """It has to say what would land, not only what the agents did."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    (repo / "mine.txt").write_text("mine\n")
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+
+    row = snap.preview()[0]
+
+    assert "mine.txt" in row.files
+
+
+def test_the_preview_of_a_repository_with_no_history_diffs_from_nothing(tmp_path):
+    """There is no base commit to diff against; every file is simply new."""
+
+    repo = tmp_path / "fresh"
+    repo.mkdir()
+    run("init", "-q", "-b", "main", cwd=repo)
+    run("config", "user.email", "t@example.com", cwd=repo)
+    run("config", "user.name", "test", cwd=repo)
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "one\n"}, 2)
+    snap.capture_final()
+
+    row = snap.preview()[0]
+
+    assert row.files == ("a.txt",)
+    assert (row.added, row.removed) == (1, 0)
+
+
+def test_the_preview_asks_whether_each_one_can_go_without_writing_anything(tmp_path):
+    """The whole promise of asking first is that asking costs nothing."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    run("update-ref", "refs/heads/main", snap.summary()[0].branch, cwd=repo)
+    before = state(repo)
+
+    row = snap.preview()[0]
+
+    assert not row.mergeable
+    assert row.refusal == "a.txt was edited on main too"
+    assert state(repo) == before  # asked, and nothing moved
+
+
+def test_only_the_repositories_you_picked_are_merged(tmp_path):
+    one = make_repo(tmp_path / "one", {"a.txt": "one\n"})
+    two = make_repo(tmp_path / "two", {"b.txt": "one\n"})
+    snap = Snapshotter(tmp_path, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {one / "a.txt": "two\n", two / "b.txt": "two\n"}, 2)
+    snap.capture_final()
+    snap.merge(only=[one], kept="you kept the branch")
+
+    rows = {entry.repo: entry for entry in snap.summary()}
+    picked, passed = rows[one], rows[two]
+
+    assert picked.merged is True
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=one) == "main"
+    assert passed.merged is False
+    assert passed.note == "you kept the branch"
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=two) == "dai/run1"
+    assert run("rev-parse", "main", cwd=two) != run("rev-parse", "dai/run1", cwd=two)
+
+
+def test_a_repository_that_could_not_go_says_so_rather_than_that_you_kept_it(tmp_path):
+    """Two different things, and the record must not read them as one."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    run("update-ref", "refs/heads/main", snap.summary()[0].branch, cwd=repo)
+    snap.merge(only=(), kept="you kept the branch")
+
+    assert snap.summary()[0].note == "a.txt was edited on main too"
+
+
+def test_merging_nothing_is_recorded_as_a_decision_not_as_silence(tmp_path):
+    """`merge = false` never asked; a declined prompt did. Both leave a branch."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    snap.merge(only=(), kept="you kept the branch")
+
+    entry = snap.summary()[0]
+
+    assert entry.merged is False
+    assert entry.note == "you kept the branch"
+    assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
+
+
 def test_merging_targets_the_branch_the_run_was_rooted_on(tmp_path):
     """Not master by fiat: whatever `branch_from` settled on is the target."""
 
@@ -725,7 +854,9 @@ def test_merging_is_refused_when_the_base_branch_moved(tmp_path):
     merged = snap.merge()
 
     assert merged[0].merged is False
-    assert "moved" in merged[0].note
+    # Named, not just "main moved": which file landed is what tells you whether
+    # this is a conflict to sit down with or a rename to wave through.
+    assert merged[0].note == "a.txt was edited on main too"
     assert run("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) == "dai/run1"
 
 

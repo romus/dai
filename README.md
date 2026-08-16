@@ -47,6 +47,7 @@ dai --rigor brutal "make the retry logic actually correct"   # easy·standard·s
 dai --lang <language> "pon la documentación al día con el código"
 dai --solver codex --critic claude "refactor the config loader"
 dai --no-tui "regenerate the CLI reference in docs/"
+dai --merge "bring the changelog up to date"      # merge back without asking
 dai --no-merge "bring the changelog up to date"   # leave it on the run's branch
 dai --branch-from current "tidy up the tests"     # branch off where I am, not the trunk
 dai --runs                                        # past runs; --show <id> prints one
@@ -92,7 +93,7 @@ mid-run theme change on terminals that report one. `--theme dark|light` pins one
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented. Defaults:
 `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to the critic,
-per-round commits on, merged back into your branch on agreement. `rigor` sets how hard
+per-round commits on, and on agreement you are asked what to merge. `rigor` sets how hard
 the two lean on each other — the evidence rules hold at every level, it is how far the
 critic hunts and how hard the solver defends; above `standard`, expect more rounds and
 more spend.
@@ -107,7 +108,7 @@ completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
 
 [snapshot]
 branch_from = "default"       # the trunk; or "current", or a branch name
-merge = true                  # on agreement, fast-forward that branch onto the work
+merge = "ask"                 # on agreement: "ask" · true (just do it) · false (never)
 ```
 
 ## Branches and commits
@@ -118,6 +119,17 @@ ordinary commit, and at consensus that base branch is fast-forwarded onto the re
 leaving you on your own branch with the work committed and `git status` clean. Only
 consensus merges: a deadlock, a run out of budget or one you killed leaves you on
 `dai/<run-id>` instead.
+
+By default dai asks first. On agreement it shows you every repository that changed —
+what it would merge into, how many lines either way, and which files — and merges the
+ones you tick; in a plain terminal the same thing is a `[y/N]` question. Nothing is
+written until you answer, and every branch survives whichever way you answer. Piped or
+redirected, with nobody to ask, nothing is merged and the report says so. `merge = true`
+skips the question, `merge = false` never merges at all.
+
+A repository whose base branch moved while the agents were working is refused whatever
+you say — the reason names the file that landed there — and stays on `dai/<run-id>`,
+yours to merge by hand.
 
 **Repositories nothing changed in are not touched at all.** Whatever was uncommitted
 before you started is kept as a `baseline` commit of its own. Not one file on disk is
