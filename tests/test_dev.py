@@ -17,7 +17,7 @@ pytest.importorskip("dai.dev", reason="dev tools are stripped from a released bu
 from dai.budget import Budget, Limits
 from dai.consensus import Referee
 from dai.dev.engine import FakeEngine
-from dai.dev.scenarios import SCENARIOS
+from dai.dev.scenarios import SCENARIOS, describe
 from dai.dev.screens import NAMES, _Host
 from dai.engines import ENGINES, build_engine
 from dai.models import Outcome
@@ -112,23 +112,40 @@ async def test_a_critic_turn_writes_nothing(tmp_path):
 # --- the scenarios reach the endings they exist to show --------------------
 
 
-@pytest.mark.parametrize(
-    "scenario, outcome",
-    [
-        ("agree", Outcome.CONSENSUS),
-        ("quick", Outcome.CONSENSUS),
-        ("rubber-stamp", Outcome.CONSENSUS),
-        ("deadlock", Outcome.DEADLOCK),
-        ("rounds", Outcome.ROUNDS),
-        ("budget", Outcome.BUDGET),
-    ],
-)
-async def test_each_scenario_ends_the_way_it_advertises(scenario, outcome, tmp_path):
-    """A scenario that stops reaching its ending stops showing its screen."""
+@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
+async def test_each_scenario_ends_the_way_it_advertises(scenario, tmp_path):
+    """A scenario that stops reaching its ending stops showing its screen.
 
-    result = await played(scenario, tmp_path).run()
+    Asserted against the scenario's own `ends`, not a table kept beside it:
+    that field is what `--scenarios` derives the "shows" column from, so this
+    is also what stops the listing telling you about a dialog you will not get.
+    """
 
-    assert result.outcome is outcome, f"{scenario}: {result.reason}"
+    picked = SCENARIOS[scenario]
+    debate = played(scenario, tmp_path)
+    if picked.policy == "ask":
+        # Nobody to ask in a test; the policy still has to resolve to something.
+        async def on_deadlock(pending):
+            return "critic"
+
+        debate.on_deadlock = on_deadlock
+
+    result = await debate.run()
+
+    assert result.outcome is picked.ends, f"{scenario}: {result.reason}"
+
+
+def test_the_listing_only_promises_a_merge_dialog_where_one_is_offered():
+    """Only consensus is offered a merge — a listing that forgets that lies."""
+
+    for name, picked in SCENARIOS.items():
+        offered = picked.shows == "merge dialog"
+        assert offered is (picked.ends is Outcome.CONSENSUS), name
+
+    shown = "\n".join(describe())
+
+    assert "merge dialog" in shown and "deadlock modal" in shown
+    assert all(name in shown for name in SCENARIOS)
 
 
 async def test_the_asking_scenario_actually_asks(tmp_path):
