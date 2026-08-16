@@ -23,10 +23,12 @@ from dai.models import (
 from dai.protocol import (
     CRITIC_SCHEMA,
     SOLVER_SCHEMA,
+    STANDARD,
     critique_first_prompt,
     critique_next_prompt,
     parse_critic,
     parse_solver,
+    prove_prompt,
     rebut_prompt,
     solve_prompt,
 )
@@ -82,6 +84,7 @@ class Debate:
         referee: Referee | None = None,
         deadlock_policy: str = "critic",
         language: str = "auto",
+        rigor: str = STANDARD,
         solver_writes: bool = True,
         on_event: Callable[[DebateEvent], None] | None = None,
         on_agent_event: Callable[[Role, AgentEvent], None] | None = None,
@@ -97,6 +100,7 @@ class Debate:
         self.referee = referee or Referee()
         self.deadlock_policy = deadlock_policy
         self.language = language
+        self.rigor = rigor
         self.solver_access = Access.WRITE if solver_writes else Access.READ_ONLY
         self.on_event = on_event
         self.on_agent_event = on_agent_event
@@ -112,6 +116,10 @@ class Debate:
         self._stopped = False
         self._announced: set[int] = set()
         self._injections: list[str] = []
+        #: Rounds where the critic has already been sent its verdict back once.
+        self._proved: set[int] = set()
+        #: Whether the softer of the referee's two approval rules has been spent.
+        self._challenged = False
 
     # --- control ----------------------------------------------------------
 
@@ -202,6 +210,15 @@ class Debate:
             if assessment.deadlocked:
                 return await self._resolve_deadlock(current, critique)
 
+            if not critique.open_issues:
+                # An approval the critic would not substantiate, even after being
+                # asked. There is nothing to rebut, and sending a write-access
+                # agent to "make the fixes" over an empty list is how this used
+                # to end. No policy applies either: there is nothing to enforce.
+                return self._finish(
+                    Outcome.DEADLOCK, "the critic would not substantiate its approval"
+                )
+
             # Count this round as spent *before* asking whether another fits,
             # otherwise the limit is checked one round behind and max_rounds=5
             # runs six.
@@ -232,7 +249,7 @@ class Debate:
             Role.SOLVE,
             self.solver,
             self._solver_session,
-            solve_prompt(self.task, language=self.language),
+            solve_prompt(self.task, language=self.language, rigor=self.rigor),
             access=self.solver_access,
             schema=SOLVER_SCHEMA,
             round_no=rnd.number,
@@ -250,7 +267,7 @@ class Debate:
             Role.REBUT,
             self.solver,
             self._solver_session,
-            rebut_prompt(issues, final=final, language=self.language),
+            rebut_prompt(issues, final=final, language=self.language, rigor=self.rigor),
             access=self.solver_access,
             schema=SOLVER_SCHEMA,
             round_no=rnd.number,
@@ -268,10 +285,21 @@ class Debate:
         solver: SolverTurn,
     ) -> CriticTurn | None:
         if previous is None:
-            prompt = critique_first_prompt(self.task, solver, language=self.language)
+            prompt = critique_first_prompt(
+                self.task, solver, language=self.language, rigor=self.rigor
+            )
         else:
+            # Open issues only. The critic is told to keep the ones it conceded
+            # in `issues`, and a conceded issue rendered back at it comes with
+            # "NO ANSWER — the solver ignored this one" against a point the
+            # critic itself dropped: it re-raises, the open set churns, and the
+            # referee never sees the argument stall.
             prompt = critique_next_prompt(
-                rnd.number, previous.issues, solver, language=self.language
+                rnd.number,
+                previous.open_issues,
+                solver,
+                language=self.language,
+                rigor=self.rigor,
             )
 
         result = await self._turn(
@@ -303,8 +331,57 @@ class Debate:
             )
             critique = parse_critic(retry.structured) if retry else None
 
+        if critique is not None:
+            critique = await self._prove(rnd, critique, solver)
+
         rnd.critic = critique
         return critique
+
+    async def _prove(
+        self, rnd: Round, critique: CriticTurn, solver: SolverTurn
+    ) -> CriticTurn:
+        """Send an approval nobody can audit back to the critic. Once per round.
+
+        The referee catches it either way, but the finding used to land on the
+        wrong agent: with no open issues to rebut, the next turn was the solver's
+        — write access, an empty issue list, and "make the fixes in the
+        repository now". This spends the turn on the side that owes the work,
+        and it is what makes the prompt's "you will be asked again" true.
+        """
+
+        why = self.referee.audit(critique, solver)
+        if why is None or rnd.number in self._proved:
+            return critique
+        if critique.checked:
+            # It said *something*, so this is the soft rule: its prose named
+            # nothing the solver changed. Worth one challenge a run, then it
+            # stands down — a critic that reviews by symbol name must not be
+            # made to pay a turn for it every round.
+            if self._challenged:
+                return critique
+            self._challenged = True
+
+        self._proved.add(rnd.number)
+        rnd.notes.append(f"{why}; asked it to show its work")
+        self._emit(
+            DebateEvent(
+                kind="note",
+                round=rnd.number,
+                engine=self.critic.name,
+                text=f"{why}; asking it to show its work",
+            )
+        )
+        again = await self._turn(
+            Role.CRITIQUE,
+            self.critic,
+            self._critic_session,
+            prove_prompt(why, language=self.language),
+            access=Access.READ_ONLY,
+            schema=CRITIC_SCHEMA,
+            round_no=rnd.number,
+        )
+        reasked = parse_critic(again.structured) if again else None
+        return reasked if reasked is not None else critique
 
     async def _turn(
         self,
@@ -463,7 +540,7 @@ class Debate:
 
     def _note_referee(self, rnd: Round, assessment: Assessment) -> None:
         if assessment.rubber_stamp:
-            rnd.notes.append("critic approved without listing what it checked")
+            rnd.notes.append(assessment.reason)
         for issue in assessment.repeats:
             rnd.notes.append(
                 f"critic re-raised [{issue.id}] without answering the rebuttal"

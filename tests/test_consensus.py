@@ -51,6 +51,51 @@ def test_approval_without_evidence_of_checking_is_refused():
     assert "without saying what it checked" in assessment.reason
 
 
+def test_an_approval_naming_no_changed_file_fails_the_audit():
+    """`checked: ["reviewed the changes"]` used to pass everything there was."""
+
+    reason = Referee().audit(
+        approve(checked=("reviewed the changes",)),
+        SolverTurn(files_changed=["src/parse.py"]),
+    )
+
+    assert reason is not None
+    assert "naming any file the solver changed" in reason
+
+
+def test_that_audit_can_cost_a_turn_but_never_the_run():
+    """It reads prose and can be wrong, so only the orchestrator may act on it."""
+
+    critic, solver = approve(checked=("reviewed the changes",)), SolverTurn(
+        files_changed=["src/parse.py"]
+    )
+
+    assert Referee().judge(critic, solver=solver).settled
+
+
+def test_naming_the_changed_file_passes_the_audit():
+    critic = approve(checked=("/repo/src/parse.py:1-9 — matches the task",))
+
+    assert Referee().audit(critic, SolverTurn(files_changed=["src/parse.py"])) is None
+
+
+def test_the_audit_is_off_when_the_solver_reported_no_files():
+    """The raw-text fallback for an unparseable solver report has no file list."""
+
+    critic = approve(checked=("read what I could find",))
+
+    assert Referee().audit(critic, SolverTurn(summary="prose")) is None
+
+
+def test_an_empty_checked_fails_the_audit_with_or_without_the_solver():
+    assert Referee().audit(approve(checked=())) is not None
+    assert Referee().audit(approve(checked=()), SolverTurn(files_changed=["a.md"]))
+
+
+def test_request_changes_is_never_audited_as_an_approval():
+    assert Referee().audit(changes(issue()), SolverTurn(files_changed=["a.md"])) is None
+
+
 def test_request_changes_with_everything_conceded_settles():
     assessment = Referee().judge(changes(issue(), conceded=["i1"]))
 

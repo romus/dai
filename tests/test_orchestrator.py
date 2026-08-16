@@ -122,20 +122,79 @@ async def test_the_solver_writes_and_the_critic_only_reads(tmp_path):
     assert all(a.value == "read_only" for a in critic.accesses)
 
 
-async def test_rubber_stamp_does_not_end_the_argument(tmp_path):
-    """APPROVE with nothing checked must not settle it on the spot."""
+async def test_an_unaudited_approval_is_sent_back_to_the_critic(tmp_path):
+    """APPROVE with nothing checked must cost the critic a turn, not the solver.
 
-    d, solver, critic = debate(
-        tmp_path,
-        [solved(), solved()],
-        [approve(checked=()), approve()],
-    )
+    It used to cost the solver one: with no open issues to rebut, the next turn
+    was a write-access agent told to make fixes over an empty list.
+    """
+
+    d, solver, critic = debate(tmp_path, [solved()], [approve(checked=()), approve()])
 
     result = await d.run()
 
     assert result.outcome is Outcome.CONSENSUS
-    assert len(result.rounds) == 2, "the empty approval should have been challenged"
-    assert any("without listing what it checked" in n for n in result.rounds[0].notes)
+    assert len(critic.prompts) == 2
+    assert "was not accepted" in critic.prompts[1]
+    assert len(solver.prompts) == 1, "the solver must not be asked to fix nothing"
+    assert any("what it checked" in n for n in result.rounds[0].notes)
+
+
+async def test_a_critic_that_will_not_substantiate_never_reaches_the_solver(tmp_path):
+    """Asked twice and still showing nothing: that is not agreement to act on."""
+
+    d, solver, critic = debate(
+        tmp_path, [solved()], [approve(checked=()), approve(checked=())]
+    )
+
+    result = await d.run()
+
+    assert result.outcome is Outcome.DEADLOCK
+    assert "would not substantiate" in result.reason
+    assert len(solver.prompts) == 1
+
+
+async def test_an_approval_naming_no_changed_file_is_challenged_once(tmp_path):
+    """The soft rule may cost a turn; it may never cost the run."""
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved()],
+        [approve(checked=("skimmed the diff",)), approve(checked=("skimmed it again",))],
+    )
+
+    result = await d.run()
+
+    assert result.outcome is Outcome.CONSENSUS, "prose we cannot parse is not a verdict"
+    assert len(critic.prompts) == 2
+    assert "naming any file the solver changed" in critic.prompts[1]
+
+
+async def test_the_next_critique_is_not_shown_issues_it_conceded(tmp_path):
+    """A conceded issue rendered back reads as "NO ANSWER" against the critic's
+    own concession — it re-raises, the open set churns, and deadlock never fires."""
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved(), solved(responses=replies(("i1", "FIXED")))],
+        [changes("first", "second", ids=["i1", "i2"], conceded=["i2"]), approve()],
+    )
+
+    await d.run()
+
+    assert "NO ANSWER" not in critic.prompts[1]
+    assert "second" not in critic.prompts[1]
+
+
+async def test_rigor_reaches_both_agents(tmp_path):
+    """The user asked for a harsher review; both sides have to hear about it."""
+
+    d, solver, critic = debate(tmp_path, [solved()], [approve()], rigor="brutal")
+
+    await d.run()
+
+    assert "Depth for this run: maximum" in solver.prompts[0]
+    assert "Depth for this run: maximum" in critic.prompts[0]
 
 
 # --- deadlock -------------------------------------------------------------

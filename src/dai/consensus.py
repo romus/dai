@@ -10,6 +10,7 @@ referee keeps history and judges the sequence.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dai.models import Action, CriticTurn, Issue, Severity, SolverTurn, Verdict
 
@@ -59,11 +60,15 @@ class Referee:
         stale = self._stalled_rounds >= self.no_progress_rounds
 
         if critic.verdict is Verdict.APPROVE:
-            if not critic.checked:
+            # Without the solver on purpose: only the hard half of `audit` may
+            # decide a run. The softer rule reads prose, and a heuristic that
+            # can end a run in disagreement is worse than one that only costs a
+            # turn — the orchestrator uses it to send the verdict back instead.
+            if (unaudited := self.audit(critic)) is not None:
                 # An approval nobody can audit is worth nothing; make it argue.
                 return Assessment(
                     settled=False,
-                    reason="critic approved without saying what it checked",
+                    reason=unaudited,
                     stale=stale,
                     repeats=repeats,
                     rubber_stamp=True,
@@ -93,6 +98,33 @@ class Referee:
             stale=stale,
             repeats=repeats,
         )
+
+    def audit(self, critic: CriticTurn, solver: SolverTurn | None = None) -> str | None:
+        """Why this approval cannot be audited, if it cannot.
+
+        Two rules of different strength, which is why the solver is optional.
+        Without it, only the hard one applies — an approval that says it checked
+        nothing — and that one is allowed to decide a round. With it, the softer
+        one applies too: an approval whose prose names nothing the solver
+        changed. That one reads text and can be wrong, so only the orchestrator
+        asks it, and only to send the verdict back for one more look.
+        """
+
+        if critic.verdict is not Verdict.APPROVE:
+            return None
+        if not critic.checked:
+            return "critic approved without saying what it checked"
+        if solver is None or not solver.files_changed:
+            # Nothing to cross-check against: a solver report that was not JSON
+            # is kept as raw text, with no file list of its own.
+            return None
+        # Basenames, because the two sides write paths differently — one
+        # absolute, one relative to the repo — and only the tail is comparable.
+        names = {name for p in solver.files_changed if (name := Path(p).name.lower())}
+        blob = " ".join(critic.checked).lower()
+        if any(name in blob for name in names):
+            return None
+        return "critic approved without naming any file the solver changed"
 
     # --- internals --------------------------------------------------------
 

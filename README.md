@@ -2,10 +2,11 @@
 
 Two CLI coding agents argue about your task until they agree.
 
-The **solver** does the work in your current directory; the **critic**, on a different
-engine, reviews it and pushes back. The solver answers — fixing what it accepts,
-refusing what it doesn't, with reasons — until they agree or the rounds or budget
-run out.
+The **solver** does the work in your current directory and signs for it. The **critic**,
+on a different engine, reviews the repository rather than that report, and an approval
+that names nothing it examined is sent back rather than accepted. The solver answers —
+fixing what it accepts, refusing what it doesn't, with reasons — until they agree or the
+rounds or budget run out.
 
 ![The task box with the @ picker open, offering index.html, and the key hints underneath](docs/screenshot-task.png)
 
@@ -22,7 +23,7 @@ run out.
 make install        # create the venv, install deps
 make doctor         # check uv / claude / codex are actually installed
 make init           # write ~/.config/dai/config.toml (annotated)
-make test           # 327 tests
+make test           # 351 tests
 
 make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 ```
@@ -42,6 +43,7 @@ cd ~/projects/foo && dai "bring the README in line with the code"
 ```bash
 dai --rounds 3 --budget 2 "tidy up the error handling in api/"
 dai --dry-run "what would you change about the logging setup?"
+dai --rigor brutal "make the retry logic actually correct"   # easy·standard·strict·brutal
 dai --lang <language> "pon la documentación al día con el código"
 dai --solver codex --critic claude "refactor the config loader"
 dai --no-tui "regenerate the CLI reference in docs/"
@@ -90,9 +92,15 @@ mid-run theme change on terminals that report one. `--theme dark|light` pins one
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented. Defaults:
 `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to the critic,
-per-round commits on, merged back into your branch on agreement.
+per-round commits on, merged back into your branch on agreement. `rigor` sets how hard
+the two lean on each other — the evidence rules hold at every level, it is how far the
+critic hunts and how hard the solver defends; above `standard`, expect more rounds and
+more spend.
 
 ```toml
+[critique]
+rigor = "standard"            # easy · standard · strict · brutal
+
 [tui]
 theme = "auto"                # "auto" follows the terminal; or pin "dark"/"light"
 completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
@@ -134,9 +142,11 @@ being the right answer the moment anything moves.
 
 - **Codex reports tokens, not cost.** Its spend shows as *unmeasured* rather
   than as zero; add `[pricing.codex]` to the config for an estimate.
-- **The claude critic runs read-only (`plan` mode)** and so cannot run your
-  tests; the codex critic in `read-only` sandbox can. See `critic_args` in the
-  config to change that.
+- **The claude critic reviews by reading (`plan` mode)** and cannot run your tests, so
+  its evidence is quoted source rather than command output; the codex critic in
+  `read-only` sandbox can run them. Neither is asked to fake the other. To let the
+  claude critic run checks too, `critic_args` in the config shows the swap — it trades
+  a hard read-only guarantee for a tool denylist.
 - **Agents read your files** — use `--dry-run` in repositories you don't trust.
 
 ## Licence

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dai.budget import Limits, Pricing
+from dai.protocol import RIGOR, STANDARD
 
 APP = "dai"
 
@@ -47,6 +48,7 @@ class Config:
     no_progress_rounds: int = 2
     stop_on_minor_only: bool = True
     deadlock_policy: str = "critic"
+    rigor: str = STANDARD
     language: str = "auto"
     theme: str = "auto"
     completion_debounce_ms: int = 80
@@ -113,6 +115,18 @@ theme = "auto"
 # How long to wait after a keystroke before refiltering the @ path list.
 # 0 filters on every character.
 completion_debounce_ms = 80
+
+[critique]
+# How hard the two agents lean on each other. The evidence rules are the same at
+# every level — an approval always has to name what it examined, and an issue
+# always needs a file:line or real command output — this sets how far the critic
+# hunts and how hard the solver defends its work.
+#   "easy"     — is the task done, is anything broken; nothing beyond that
+#   "standard" — every clause of the task, plus one look where the solver did not
+#   "strict"   — assume a defect is there and go find it: error paths, callers, tests
+#   "brutal"   — hostile review, and a solver told to hold its ground
+# Above "standard", expect more rounds and more spend before they agree.
+rigor = "standard"
 
 [consensus]
 no_progress_rounds = 2   # identical complaints this many rounds running = deadlock
@@ -340,6 +354,7 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
         no_progress_rounds=int(consensus.get("no_progress_rounds", 2)),
         stop_on_minor_only=bool(consensus.get("stop_on_minor_only", True)),
         deadlock_policy=str(deadlock.get("policy", "critic")),
+        rigor=_rigor(raw.get("critique") or {}),
         language=str((raw.get("output") or {}).get("language", "auto")),
         theme=_theme(raw.get("tui") or {}),
         # `or 80` would be wrong here: 0 is a real value meaning "no debounce",
@@ -359,6 +374,13 @@ def from_dict(raw: dict, *, source: Path | None = None) -> Config:
         pricing=pricing,
         source=source,
     )
+
+
+def _rigor(critique: dict) -> str:
+    # A level nobody recognises means "standard": a typo should cost the run its
+    # harshness, not the run.
+    value = str(critique.get("rigor", STANDARD)).strip().lower()
+    return value if value in RIGOR else STANDARD
 
 
 def _theme(tui: dict) -> str:
