@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from pathlib import Path
 
+from rich.table import Table
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -14,15 +16,24 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static
 from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
+from dai.config import Merge
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
-from dai.snapshot import Snapshotter, describe
+from dai.snapshot import MergeCandidate, Snapshotter, describe, merge_promise
 from dai.transcript import Transcript
 from dai.tui import theme
 from dai.tui.appearance import AppearanceChanged, driver_class
 from dai.tui.completion import DEFAULT_DEBOUNCE_MS, CompletingInput
-from dai.tui.theme import apply_theme, hint
-from dai.tui.widgets import AgentPane, StatusBar, VerdictLog
+from dai.tui.theme import apply_theme, hint, spaced
+from dai.tui.widgets import (
+    AgentPane,
+    Cell,
+    IssueCase,
+    IssueRow,
+    RepoRow,
+    StatusBar,
+    VerdictLog,
+)
 
 #: How each ending is announced. Style names, not style strings — the palette
 #: they resolve against is whichever the terminal is wearing at the time.
@@ -101,63 +112,240 @@ class InjectScreen(ModalScreen[str]):
         self.dismiss("")
 
 
-class DeadlockScreen(ModalScreen[str]):
-    """Shown when neither side will move. Nothing proceeds until you decide."""
+class DeadlockScreen(ModalScreen[dict]):
+    """Neither side will move. You rule on each complaint, and the run goes on.
 
-    #: Only these are answers; "ask" is the question, not a reply to it.
-    CHOICES = ("critic", "solver")
+    Not a verdict on the run: a ruling is evidence the argument did not have.
+    What you uphold goes back to the solver as binding instructions, what you
+    dismiss leaves the argument for good, and the critic reviews what comes
+    back — so a run headed for disagreement can still end in agreement.
 
-    def __init__(self, result: DebateResult, default: str) -> None:
+    Answers with a `Ruling`: fingerprint -> "critic" | "solver". Fingerprints,
+    not ids, because the answer outlives this critique and ids are renumbered
+    freely between rounds.
+    """
+
+    AUTO_FOCUS = ""
+    MAX_ROWS = 24
+
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (24, "-tall")]
+
+    BINDINGS = [
+        Binding("up,k", "cursor(-1)", "up", show=False),
+        Binding("down,j", "cursor(1)", "down", show=False),
+        Binding("left,c", "rule('critic')", "critic is right"),
+        Binding("right,s", "rule('solver')", "solver is right"),
+        Binding("enter", "carry_on", "continue"),
+        # Consumed here for the same reason MergeScreen consumes it: the app's
+        # `q` would cancel the very worker awaiting this screen.
+        Binding("escape,q", "give_up", "use the default"),
+    ]
+
+    def __init__(self, result: DebateResult, default: str, *, stalled: int = 2) -> None:
         super().__init__()
         self.result = result
-        # policy="ask" is precisely how we got here, so it cannot also be the
-        # pre-selected answer — focusing a button that does not exist crashes
-        # the screen at the moment the user is most needed.
-        self.default = default if default in self.CHOICES else "critic"
+        # "ask" is how we got here, so it cannot also be the fallback.
+        self.default = default if default in ("critic", "solver") else "critic"
+        self.stalled = stalled
+        self.cases = _read_the_argument(result)
+        self.rulings: dict[str, str] = {}
+        self._cursor = 0
+
+    # --- what it says -----------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("They will not converge", classes="title")
-            yield Static(self.result.reason)
-            with VerticalScroll(id="deadlock-issues"):
-                for issue in self.result.open_issues:
-                    line = Text()
-                    line.append(f"[{issue.id}] ", style=theme.S_MUTED)
-                    line.append(f"({issue.severity.value}) ", style=theme.WARNING)
-                    line.append(issue.claim, style=theme.S_TEXT)
-                    yield Static(line)
-                    if issue.evidence:
-                        yield Static(
-                            Text(f"      {issue.evidence}", style=theme.S_MUTED)
-                        )
-            with Horizontal():
-                yield Button("Critic is right", variant="warning", id="critic")
-                yield Button("Solver is right", variant="primary", id="solver")
-            yield Static(
-                Text(
-                    f"default for this run: {self.default} wins",
-                    style=theme.S_MUTED,
-                )
-            )
+        with Vertical(id="deadlock-card"):
+            yield Cell(self._paint_outcome, id="deadlock-outcome")
+            yield Cell(self._paint_title, id="deadlock-title")
+            yield Cell(self._paint_lede, id="deadlock-lede")
+            with _RowList(id="deadlock-issues"):
+                for index, case in enumerate(self.cases):
+                    yield IssueRow(case, id=f"issue-{index}")
+            with Horizontal(id="deadlock-actions"):
+                yield Button(self._go_label(), variant="primary", id="deadlock-go")
+                yield Cell(self._paint_left, id="deadlock-left")
+            yield Cell(self._paint_footnote, id="deadlock-footnote")
 
     def on_mount(self) -> None:
-        self._focus_default()
+        for button in self.query(Button):
+            button.can_focus = False
+        self._sync()
 
-    def repaint(self) -> None:
-        """The issue list bakes its colours in, so a theme change rebuilds it.
+    def on_resize(self, event: events.Resize) -> None:
+        self._fit()
 
-        This screen can sit there for as long as the user takes to decide, so
-        it is the one modal that really can outlive the palette it was drawn in.
+    def _fit(self) -> None:
+        """Same budgeting as the merge screen, and for the same reason.
+
+        The card is `height: auto` under a `max-height`, which clamps without
+        making anything inside give way — and what gets clipped is the bottom,
+        where the way to answer lives.
         """
 
-        self.refresh(recompose=True)
-        self.call_after_refresh(self._focus_default)
+        card = self.query_one("#deadlock-card", Vertical)
+        listing = self.query_one("#deadlock-issues", _RowList)
+        chrome = sum(
+            child.outer_size.height + child.styles.margin.height
+            for child in card.children
+            if child is not listing
+        )
+        budget = (self.size.height * 9) // 10 - 4 - chrome
+        listing.styles.max_height = max(4, min(self.MAX_ROWS, budget))
 
-    def _focus_default(self) -> None:
-        self.query_one(f"#{self.default}", Button).focus()
+    def repaint(self) -> None:
+        """Not `recompose`: it would take the cursor and every ruling with it."""
+
+        for cell in self.query(Cell):
+            cell.refresh()
+        for row in self.query(IssueRow):
+            row.refresh()
+
+    def _paint_outcome(self):
+        colour = theme.color("warning")
+        label = Text()
+        label.append("● ", style=colour)
+        label.append(spaced("DEADLOCK"), style=f"bold {colour}")
+        # A grid rather than padding: the tally has to reach the right edge at
+        # any width, and a `rjust` guessed against the screen wraps instead.
+        row = Table.grid(expand=True)
+        row.add_column(no_wrap=True)
+        row.add_column(justify="right", ratio=1, no_wrap=True)
+        row.add_row(
+            label,
+            Text(
+                f"{len(self.rulings)} of {len(self.cases)} decided",
+                style=theme.S_MUTED,
+            )
+            if self.cases
+            else "",
+        )
+        return row
+
+    def _paint_title(self) -> Text:
+        count = len(self.cases)
+        title = (
+            "Nothing is on the table. Who is right?"
+            if not count
+            else f"{count} issue{'s are' if count != 1 else ' is'} still open. Who is right?"
+        )
+        return Text(title, style=theme.style("strong"))
+
+    def _paint_lede(self) -> Text:
+        # Never hardcode the stall: this screen also serves a run that ran out
+        # of rounds or money, where nobody was stalling at all.
+        head = (
+            f"Neither side moved for {self.stalled} rounds. "
+            if self.result.outcome is Outcome.DEADLOCK
+            else f"{self.result.reason.capitalize()}. "
+        )
+        return Text(f"{head}Decide each, then continue.", style=theme.S_MUTED)
+
+    def _paint_left(self) -> Text:
+        left = len(self.cases) - len(self.rulings)
+        if not left:
+            return Text("all decided", style=theme.S_MUTED)
+        return Text(f"{left} issue{'s' if left != 1 else ''} left", style=theme.S_MUTED)
+
+    def _paint_footnote(self) -> Text:
+        return Text(
+            "Your calls become the arbiter's ruling for the next round.",
+            style=theme.S_MUTED,
+        )
+
+    def _go_label(self) -> str:
+        return "↵  Continue"
+
+    # --- what it does -----------------------------------------------------
+
+    def action_cursor(self, delta: int) -> None:
+        if not self.cases:
+            return
+        self._cursor = (self._cursor + delta) % len(self.cases)
+        self._sync()
+        self.query_one(f"#issue-{self._cursor}", IssueRow).scroll_visible(animate=False)
+
+    def action_rule(self, side: str) -> None:
+        if not self.cases:
+            return
+        self.rulings[self.cases[self._cursor].issue.fingerprint] = side
+        # Move to the next one still undecided, so a run of decisions is a run
+        # of keystrokes; wrapping to an already-decided row would be a dead end.
+        for step in range(1, len(self.cases) + 1):
+            nxt = (self._cursor + step) % len(self.cases)
+            if self.cases[nxt].issue.fingerprint not in self.rulings:
+                self._cursor = nxt
+                break
+        self._sync()
+
+    def action_carry_on(self) -> None:
+        # Guarded on the count, not the button: enter must be inert while
+        # anything is undecided whether or not a button happens to exist.
+        if len(self.rulings) < len(self.cases):
+            return
+        self.dismiss(dict(self.rulings))
+
+    def action_give_up(self) -> None:
+        """Bail out, and hand the rest to the configured default."""
+
+        answer = dict(self.rulings)
+        for case in self.cases:
+            answer.setdefault(case.issue.fingerprint, self.default)
+        self.dismiss(answer)
+
+    def _sync(self) -> None:
+        for index, row in enumerate(self.query(IssueRow)):
+            row.ruling = self.rulings.get(row.case.issue.fingerprint, "")
+            row.at_cursor = index == self._cursor
+        button = self.query_one("#deadlock-go", Button)
+        button.disabled = len(self.rulings) < len(self.cases)
+        for cell_id in ("#deadlock-outcome", "#deadlock-left"):
+            self.query_one(cell_id, Cell).refresh()
+        self.call_after_refresh(self._fit)
+
+    def on_issue_row_ruled(self, event: IssueRow.Ruled) -> None:
+        event.stop()
+        self._cursor = list(self.query(IssueRow)).index(event.row)
+        self.action_rule(event.side)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id or self.default)
+        event.stop()
+        self.action_carry_on()
+
+
+def _read_the_argument(result: DebateResult) -> list[IssueCase]:
+    """Pair each open complaint with the answer the solver gave it.
+
+    Awkward on purpose, because the data is: within a round the solver moves
+    before the critic, so `rounds[-1].solver` answers the ids of
+    `rounds[-2].critic` — one round stale. The join is by `Issue.fingerprint`,
+    which the deadlock condition itself guarantees is stable across exactly
+    those two rounds, falling back to the id and then to nothing.
+
+    Everything here is defensive: this screen also serves a run that ran out of
+    rounds or money, where there may be one round, no rebuttal, and no answer
+    to show at all.
+    """
+
+    rounds = list(result.rounds)
+    solver = rounds[-1].solver if rounds else None
+    earlier = rounds[-2].critic if len(rounds) > 1 else None
+    by_fingerprint = {i.fingerprint: i for i in (earlier.issues if earlier else [])}
+
+    cases = []
+    for issue in result.open_issues:
+        reply = None
+        if solver is not None:
+            twin = by_fingerprint.get(issue.fingerprint)
+            reply = solver.reply_to(twin.id) if twin else None
+            reply = reply or solver.reply_to(issue.id)
+        cases.append(
+            IssueCase(
+                issue=issue,
+                critic_says=issue.fix or issue.claim,
+                solver_says=reply.detail if reply else "",
+            )
+        )
+    return cases
 
 
 class ConfirmQuitScreen(ModalScreen[bool]):
@@ -191,6 +379,264 @@ class ConfirmQuitScreen(ModalScreen[bool]):
 
     def action_keep(self) -> None:
         self.dismiss(False)
+
+
+class _RowList(VerticalScroll, can_focus=False, inherit_bindings=False):
+    """The merge screen's rows: scrollable, but never focusable.
+
+    Both halves matter. A focusable `VerticalScroll` binds up and down to its
+    own scrolling, so one `tab` would take the cursor keys away from the
+    screen — and there is nothing here to focus *for*, since the rows are not
+    something you land on. The screen tracks the cursor itself.
+    """
+
+
+class MergeScreen(ModalScreen[tuple[Path, ...]]):
+    """At the end of an agreed run: which repositories go home.
+
+    Does no git. It is handed rows worked out before it opened and hands back
+    the paths that were ticked, which is what makes "nothing is written until
+    you choose" a fact about the code rather than a line in a footer.
+    """
+
+    #: Nothing here is focusable, on purpose — see BINDINGS.
+    AUTO_FOCUS = ""
+
+    #: Rows shown before the list starts scrolling, when there is room for them.
+    MAX_ROWS = 18
+
+    #: A short terminal drops the two lines that are prose rather than substance,
+    #: and a narrow one drops the hint before it crushes the controls.
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (22, "-tall")]
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (74, "-wide")]
+
+    BINDINGS = [
+        Binding("up,k", "cursor(-1)", "up", show=False),
+        Binding("down,j", "cursor(1)", "down", show=False),
+        Binding("space", "toggle", "toggle"),
+        Binding("enter", "merge", "merge"),
+        # `q` is named here so that it is *consumed*. The app's own q is a kill
+        # switch, and the thing it would kill is the worker awaiting this very
+        # screen. A modal truncates the binding chain, so this is belt and
+        # braces rather than the only guard — but it is the one that says so.
+        Binding("escape,q", "keep", "keep the branches"),
+    ]
+
+    def __init__(
+        self,
+        candidates: Sequence[MergeCandidate],
+        *,
+        run_branch: str,
+        outcome: str = "AGREED",
+    ) -> None:
+        super().__init__()
+        self.candidates = tuple(candidates)
+        self.run_branch = run_branch
+        self.outcome = outcome
+        # Everything that can go starts ticked: asking must default to the
+        # answer `merge = true` would have given, so enter is one keystroke.
+        self._selected = {row.repo for row in self.candidates if row.mergeable}
+        self._cursor = next(
+            (i for i, row in enumerate(self.candidates) if row.mergeable), 0
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="merge-card"):
+            yield Cell(self._paint_outcome, id="merge-outcome")
+            yield Cell(self._paint_title, id="merge-title")
+            yield Cell(self._paint_lede, id="merge-lede")
+            yield Cell(self._paint_from, id="merge-from")
+            with _RowList(id="merge-rows"):
+                for index, candidate in enumerate(self.candidates):
+                    yield RepoRow(
+                        candidate, run_branch=self.run_branch, id=f"merge-row-{index}"
+                    )
+            with Horizontal(id="merge-actions"):
+                yield Button(self._merge_label(), variant="primary", id="merge-go")
+                # A Button, not a keycap: same border, same box, so the pair
+                # reads as one size — and a thing that looks pressable has to
+                # be pressable. It acts on the row under the cursor, which is
+                # the only row a click on it could unambiguously mean.
+                yield Button("space  Toggle", id="merge-toggle")
+                yield Cell(self._paint_keep, id="merge-keep")
+            yield Cell(self._paint_footnote, id="merge-footnote")
+
+    def on_mount(self) -> None:
+        # Nothing on this screen may take focus. A focused Button would answer
+        # `enter` with its own binding, so a click on Toggle would leave the
+        # next `enter` pressing Toggle again instead of merging.
+        for button in self.query(Button):
+            button.can_focus = False
+        self._sync()
+        # The first fit has to wait for the children to have a real size.
+        self.call_after_refresh(self._fit)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._fit()
+
+    def _fit(self) -> None:
+        """Hand the list the height the rest of the card is not using.
+
+        The card is `height: auto` under a `max-height`, which clamps it without
+        making anything inside give way — so past a certain terminal height the
+        surplus is simply clipped, and what it clips is the bottom: the button,
+        the way out, and the promise that nothing has been written yet. A
+        question you cannot see how to answer is worse than a short list, and
+        the list is the only part of this screen that can honestly be shortened,
+        so it is the part that pays.
+
+        The chrome is measured, not counted. A constant here would be a number
+        nobody remembers to change, and the first line added to the card would
+        start quietly cutting the answer off again.
+        """
+
+        card = self.query_one("#merge-card", Vertical)
+        listing = self.query_one("#merge-rows", _RowList)
+        # `outer_size` counts border and padding but not margin, and three of
+        # these lines carry one — leave them out and the card overflows by
+        # exactly that much, which is the button's bottom edge.
+        chrome = sum(
+            child.outer_size.height + child.styles.margin.height
+            for child in card.children
+            if child is not listing
+        )
+        # The 90% and the border-plus-padding mirror `MergeScreen > Vertical`.
+        budget = (self.size.height * 9) // 10 - 4 - chrome
+        listing.styles.max_height = max(2, min(self.MAX_ROWS, budget))
+
+    def repaint(self) -> None:
+        """Draw every line again, in whichever palette is active now.
+
+        Deliberately not `recompose`, which `DeadlockScreen` can afford and
+        this cannot: it would rebuild the rows and take the cursor, the ticks
+        and the scroll position with them. Nothing here holds a baked colour —
+        the header paints from callbacks and the rows from `render()` — so
+        asking each to draw again is the whole job. The tint, the hairlines and
+        the card are `$dai-*` in the sheet, and were swapped before we ran.
+        """
+
+        for cell in self.query(Cell):
+            cell.refresh()
+        for row in self.query(RepoRow):
+            row.refresh()
+
+    # --- what it says -----------------------------------------------------
+
+    def _paint_outcome(self) -> Text:
+        color = theme.color("success")
+        line = Text()
+        line.append("● ", style=color)
+        line.append(spaced(self.outcome), style=f"bold {color}")
+        return line
+
+    def _paint_title(self) -> Text:
+        count = len(self.candidates)
+        title = (
+            "1 repository changed. Merge it?"
+            if count == 1
+            else f"{count} repositories changed. Merge which?"
+        )
+        return Text(title, style=theme.style("strong"))
+
+    def _paint_lede(self) -> Text:
+        return Text(
+            "Each merges into the branch it was taken from.", style=theme.S_MUTED
+        )
+
+    def _paint_from(self) -> Text:
+        line = Text()
+        line.append(f"{spaced('FROM')}  ", style=theme.S_MUTED)
+        line.append(self.run_branch, style=theme.S_TEXT)
+        if tail := self._branch_tail():
+            line.append(f"  ·  {tail}", style=theme.S_MUTED)
+        return line
+
+    def _branch_tail(self) -> str:
+        """`· same name in all 3` — but only when it is true.
+
+        A repository whose git would not take a slashed name took a flat one,
+        and then the headline is not the whole story; those rows say their own
+        branch instead, so this says nothing rather than something wrong.
+        """
+
+        names = {row.branch for row in self.candidates}
+        if len(self.candidates) < 2 or names != {self.run_branch}:
+            return ""
+        return "same name in both" if len(self.candidates) == 2 else (
+            f"same name in all {len(self.candidates)}"
+        )
+
+    def _paint_keep(self) -> Text:
+        line = Text()
+        line.append("esc ", style=theme.S_MUTED)
+        line.append("Keep the branches", style=theme.style("strong"))
+        return line
+
+    def _paint_footnote(self) -> Text:
+        return Text(
+            "Nothing is written until you choose. Every branch stays either way.",
+            style=theme.S_MUTED,
+        )
+
+    def _merge_label(self) -> str:
+        return f"↵  Merge {len(self._selected)} selected"
+
+    # --- what it does -----------------------------------------------------
+
+    def action_cursor(self, delta: int) -> None:
+        if not self.candidates:
+            return
+        self._cursor = (self._cursor + delta) % len(self.candidates)
+        self._sync()
+        self.query_one(f"#merge-row-{self._cursor}", RepoRow).scroll_visible(
+            animate=False
+        )
+
+    def action_toggle(self) -> None:
+        if not self.candidates:
+            return
+        row = self.candidates[self._cursor]
+        # The cursor may rest on a row that cannot go — its reason is the whole
+        # point of showing it — but space there is inert rather than a lie.
+        if not row.mergeable:
+            return
+        self._selected ^= {row.repo}
+        self._sync()
+
+    def action_merge(self) -> None:
+        # Guarded on the count, not on the button: enter has to be inert when
+        # there is nothing to merge whether or not a button happens to exist.
+        if not self._selected:
+            return
+        self.dismiss(
+            tuple(row.repo for row in self.candidates if row.repo in self._selected)
+        )
+
+    def action_keep(self) -> None:
+        self.dismiss(())
+
+    def _sync(self) -> None:
+        """Push the screen's two facts — cursor and ticks — onto the widgets."""
+
+        for index, row in enumerate(self.query(RepoRow)):
+            row.selected = row.candidate.repo in self._selected
+            row.at_cursor = index == self._cursor
+        button = self.query_one("#merge-go", Button)
+        button.label = self._merge_label()
+        button.disabled = not self._selected
+
+    def on_repo_row_picked(self, event: RepoRow.Picked) -> None:
+        event.stop()
+        self._cursor = list(self.query(RepoRow)).index(event.row)
+        self.action_toggle()
+        self._sync()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "merge-toggle":
+            self.action_toggle()
+        else:
+            self.action_merge()
 
 
 class TaskPrompt(FollowsTerminal, App[str]):
@@ -349,9 +795,7 @@ class DaiApp(FollowsTerminal, App):
             note = (
                 f"any of {len(self.snapshotter.repos)} repo(s) that changes moves "
                 f"→ {self.snapshotter.branch}, a commit per round"
-            )
-            if self.snapshotter.settings.merge:
-                note += " · merged back if they agree"
+            ) + merge_promise(self.snapshotter.settings.merge)
             verdicts.note(note)
 
         self.debate.on_event = self._on_debate_event
@@ -388,8 +832,8 @@ class DaiApp(FollowsTerminal, App):
                 f"{self.result.outcome.value}: {self.result.reason}",
             )
             self.transcript.snapshots(report)
-            if self.snapshotter.settings.merge and self.result.agreed:
-                await asyncio.to_thread(self.snapshotter.merge)
+            if self.result.agreed and self.snapshotter.settings.merge is not Merge.NEVER:
+                await self._settle_merge()
 
         path = self.transcript.finish(
             self.result,
@@ -485,17 +929,61 @@ class DaiApp(FollowsTerminal, App):
                 f"! commit skipped — {note}", style="plain-warning"
             )
 
-    async def _on_deadlock(self, pending: DebateResult) -> str:
-        """Stop everything and let the user call it."""
+    async def _on_deadlock(self, pending: DebateResult) -> dict:
+        """Stop everything and let the user rule on it, issue by issue."""
 
         self.query_one(StatusBar).set_phase("waiting for you")
-        choice = await self.push_screen_wait(
-            DeadlockScreen(pending, self.debate.deadlock_policy)
-        )
+        ruling = await self.push_screen_wait(
+            DeadlockScreen(
+                pending,
+                self.debate.deadlock_policy,
+                stalled=self.debate.referee.no_progress_rounds,
+            )
+        ) or {}
+        upheld = sum(1 for side in ruling.values() if side == "critic")
         self.query_one(VerdictLog).note(
-            f"you chose: {choice} wins", style="strong"
+            f"you upheld {upheld} of {len(ruling)}"
+            if ruling
+            else "you left it to the default",
+            style="strong",
         )
-        return choice or self.debate.deadlock_policy
+        return ruling
+
+    async def _settle_merge(self) -> None:
+        """Decide what goes home, and move it. Only ever reached on agreement.
+
+        Sits between the final commit and the transcript on purpose: after the
+        commit, so the rows it shows are the real ones; before the record, so
+        the report can state what actually happened rather than what the config
+        intended.
+        """
+
+        if self.snapshotter.settings.merge is Merge.ALWAYS:
+            await asyncio.to_thread(self.snapshotter.merge)
+            return
+
+        rows = await asyncio.to_thread(self.snapshotter.preview)
+        if not rows:
+            return
+
+        self.query_one(StatusBar).set_phase("waiting for you")
+        assert self.result is not None
+        label, _ = _OUTCOME_STYLE[self.result.outcome]
+        # `or ()` for the same reason `_on_deadlock` has its fallback: a screen
+        # dismissed by anything other than its own two exits answers nothing,
+        # and nothing must read as "keep the branches", never as consent.
+        chosen = await self.push_screen_wait(
+            MergeScreen(rows, run_branch=self.snapshotter.branch, outcome=label)
+        ) or ()
+        self.query_one(VerdictLog).note(
+            f"you chose: merge {len(chosen)} of {len(rows)}"
+            if chosen
+            else "you chose: keep the branches",
+            style="strong",
+        )
+        await asyncio.to_thread(
+            self.snapshotter.merge, only=chosen, kept="you kept the branch"
+        )
 
     # --- actions ----------------------------------------------------------
 

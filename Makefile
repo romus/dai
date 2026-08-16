@@ -24,8 +24,8 @@ test-quick: ## Run tests, quiet
 .PHONY: doctor
 doctor: ## Check the CLIs dai drives are installed
 	@command -v uv     >/dev/null && echo "  uv     $$(uv --version | cut -d' ' -f2)"     || echo "  uv     NOT FOUND"
-	@command -v claude >/dev/null && echo "  claude $$(claude --version | cut -d' ' -f1)" || echo "  claude NOT FOUND — dai cannot run"
-	@command -v codex  >/dev/null && echo "  codex  $$(codex --version | cut -d' ' -f2)"  || echo "  codex  NOT FOUND — dai cannot run"
+	@command -v claude >/dev/null && echo "  claude $$(claude --version | cut -d' ' -f1)" || echo "  claude NOT FOUND — dai cannot argue (but 'make demo' still runs)"
+	@command -v codex  >/dev/null && echo "  codex  $$(codex --version | cut -d' ' -f2)"  || echo "  codex  NOT FOUND — dai cannot argue (but 'make demo' still runs)"
 
 .PHONY: smoke
 smoke: ## End-to-end check in a throwaway sandbox — SPENDS TOKENS (override SMOKE_DIR)
@@ -44,6 +44,10 @@ smoke: ## End-to-end check in a throwaway sandbox — SPENDS TOKENS (override SM
 	@cd $(SMOKE_DIR) && git log --oneline --all --not HEAD
 
 ## Run
+
+.PHONY: demo
+demo: ## Watch a canned run — no agents, no tokens, nothing written
+	uv run dai --demo
 
 .PHONY: run
 run: ## Run in the current directory (pass ARGS, e.g. make run ARGS="'fill in docs/matrix.md'")

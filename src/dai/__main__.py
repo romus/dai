@@ -10,18 +10,20 @@ from pathlib import Path
 
 from dai import __version__, config as config_module
 from dai.budget import Budget, Limits
-from dai.config import Config, SnapshotConfig
+from dai.config import Config, Merge, SnapshotConfig
 from dai.consensus import Referee
 from dai.engines import Engine, build_engine
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
 from dai.protocol import RIGOR
 from dai.snapshot import (
+    MergeCandidate,
     Snapshotter,
     describe,
     find_repos,
     ignore_locally,
     list_branches,
+    merge_promise,
     toplevel,
 )
 from dai.transcript import Transcript, list_runs, new_run_id
@@ -72,8 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="BRANCH",
         help='what the run branches from and merges back into; "current" or a name',
     )
+    # Three switches rather than `--merge {always,ask,never}`: the task is a
+    # positional, so an optional-valued --merge would have argparse swallow
+    # `dai --merge "fix the parser"` as the flag's value and die on it.
     parser.add_argument(
-        "--merge", action="store_true", help="on agreement, merge back (the default)"
+        "--merge", action="store_true", help="on agreement, merge back without asking"
+    )
+    parser.add_argument(
+        "--ask-merge", action="store_true", help="on agreement, choose what to merge"
     )
     parser.add_argument(
         "--no-merge", action="store_true", help="leave the work on the run's branch"
@@ -86,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--snapshots", action="store_true", help="list the branches dai committed to"
     )
     parser.add_argument("--show", metavar="RUN_ID", help="print a past run's report")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="watch a canned run — no agents, no tokens, nothing written",
+    )
     parser.add_argument("--version", action="version", version=f"dai {__version__}")
     return parser
 
@@ -94,6 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cwd = (args.cwd or Path.cwd()).resolve()
 
+    if args.demo:
+        # Before the engines are built, so it runs with neither CLI installed —
+        # which is the state of the user most likely to want it.
+        from dai import demo
+
+        return demo.run(cwd, appearance=_appearance(args.theme or "auto"))
     if args.init:
         path, added = config_module.ensure_config(args.config)
         print(f"config: {path}")
@@ -142,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if missing := _missing_binaries(solver, critic):
         print(f"dai: not found on PATH: {', '.join(missing)}", file=sys.stderr)
+        # This is the moment a user has nothing to run and has just typed out a
+        # task for nothing, so it is the moment to mention the one mode that
+        # needs neither CLI.
+        print("dai: `dai --demo` shows you a run without them", file=sys.stderr)
         return EXIT_ERROR
 
     run_id = new_run_id()
@@ -233,15 +256,18 @@ def _apply_overrides(cfg: Config, args) -> Config:
         cfg.theme = args.theme
     if getattr(args, "branch_from", None):
         cfg.snapshot.branch_from = args.branch_from
+    # Order is load-bearing: the more cautious flag wins if both are given.
     if getattr(args, "merge", False):
-        cfg.snapshot.merge = True
+        cfg.snapshot.merge = Merge.ALWAYS
+    if getattr(args, "ask_merge", False):
+        cfg.snapshot.merge = Merge.ASK
     if getattr(args, "no_merge", False):
-        cfg.snapshot.merge = False
+        cfg.snapshot.merge = Merge.NEVER
     # Nothing is written during a dry run, so there is nothing to commit — and
     # so nothing to merge either, whatever the config or `--merge` asked for.
     if getattr(args, "no_snapshot", False) or getattr(args, "dry_run", False):
         cfg.snapshot.enabled = False
-        cfg.snapshot.merge = False
+        cfg.snapshot.merge = Merge.NEVER
 
     limits = cfg.limits
     cfg.limits = Limits(
@@ -380,9 +406,7 @@ async def _run_headless(
         banner = (
             f"any of {len(snapshotter.repos)} repo(s) that changes moves onto "
             f"{snapshotter.branch}, a commit per round"
-        )
-        if snapshotter.settings.merge:
-            banner += " · merged back if they agree"
+        ) + merge_promise(snapshotter.settings.merge)
         print(_colour(banner, DIM))
     print()
 
@@ -441,8 +465,8 @@ async def _run_headless(
             snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
         )
         transcript.snapshots(final)
-        if snapshotter.settings.merge and result.agreed:
-            await asyncio.to_thread(snapshotter.merge)
+        if result.agreed and snapshotter.settings.merge is not Merge.NEVER:
+            await _settle_merge(snapshotter, snapshotter.settings.merge, cwd)
 
     report_path = transcript.finish(
         result,
@@ -455,6 +479,83 @@ async def _run_headless(
     _report(result)
     _where(snapshotter, cwd, report_path)
     return result
+
+
+async def _settle_merge(snapshotter: Snapshotter, merge: Merge, cwd: Path) -> None:
+    """Decide what goes home, and move it. Only ever called on agreement.
+
+    `always` is the old behaviour untouched. `ask` shows what each repository
+    would write and takes an answer — but only if there is somebody to answer:
+    piped or redirected, nothing is merged and the record says why, which is
+    the same way `deadlock_policy = "ask"` degrades with nobody to ask.
+    """
+
+    if merge is Merge.ALWAYS:
+        await asyncio.to_thread(snapshotter.merge)
+        return
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        await asyncio.to_thread(
+            snapshotter.merge, only=(), kept="no terminal to ask on"
+        )
+        return
+
+    rows = await asyncio.to_thread(snapshotter.preview)
+    if not rows:
+        return
+    chosen = await asyncio.to_thread(_ask_merge, rows)
+    await asyncio.to_thread(
+        snapshotter.merge, only=chosen, kept="you kept the branch"
+    )
+
+
+def _ask_merge(rows: list[MergeCandidate]) -> list[Path]:
+    """Show what would be written, and ask. All of it or none of it.
+
+    Deliberately not a picker: a selector built out of raw stdin is worse than
+    an honest yes or no, and the one that can pick repository by repository is
+    the TUI. Anything but yes keeps every branch, which is also what an
+    unreadable stdin and an interrupt mean.
+    """
+
+    print()
+    print(_colour(f"{_repos(len(rows))} changed:", BOLD))
+    for row in rows:
+        counts = " ".join(
+            part
+            for part in (
+                _colour(f"+{row.added}", GREEN) if row.added else "",
+                _colour(f"-{row.removed}", RED) if row.removed else "",
+            )
+            if part
+        )
+        mark = " " if row.mergeable else "!"
+        print(f"  {mark} {row.label} → {row.base_branch}  {counts}")
+        detail = (
+            f"{row.refusal} — merge by hand"
+            if row.refusal
+            else " · ".join(row.files[:4])
+            + (f" +{len(row.files) - 4} more" if len(row.files) > 4 else "")
+        )
+        print(f"    {_colour(detail, YELLOW if row.refusal else DIM)}")
+
+    ready = [row.repo for row in rows if row.mergeable]
+    if not ready:
+        print(_colour("none of them can be merged — the branches stay", DIM))
+        return []
+
+    try:
+        answer = input(
+            f"merge {_repos(len(ready))} into their base branches? [y/N] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = ""
+    return ready if answer in ("y", "yes") else []
+
+
+def _repos(number: int) -> str:
+    return f"{number} {'repository' if number == 1 else 'repositories'}"
 
 
 def _where(snapshotter: Snapshotter, cwd: Path, report_path: Path | None) -> None:

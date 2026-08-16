@@ -24,6 +24,7 @@ from dai.protocol import (
     CRITIC_SCHEMA,
     SOLVER_SCHEMA,
     STANDARD,
+    arbitrated_prompt,
     critique_first_prompt,
     critique_next_prompt,
     parse_critic,
@@ -35,6 +36,28 @@ from dai.protocol import (
 
 #: What to do when the two will not converge.
 DEADLOCK_POLICIES = ("critic", "solver", "ask")
+
+#: How a human called each open issue, keyed by `Issue.fingerprint` rather than
+#: by id: this outlives the critique it came from — it becomes the strike list
+#: consulted every later round — and ids are per-critique, renumbered freely.
+Ruling = dict[str, str]
+
+SIDES = ("critic", "solver")
+
+
+def as_ruling(answer: Ruling | str, issues: list[Issue]) -> Ruling:
+    """Normalise an answer to a verdict per issue.
+
+    A bare side is still a valid answer and means "this one wins everything" —
+    that is what a headless run and an exhausted budget can offer. Anything
+    unrecognised is dropped rather than guessed at, and a missing verdict counts
+    as upheld: silence must never strike an issue out of the argument.
+    """
+
+    if isinstance(answer, str):
+        side = answer if answer in SIDES else "critic"
+        return {issue.fingerprint: side for issue in issues}
+    return {key: side for key, side in (answer or {}).items() if side in SIDES}
 
 
 @dataclass
@@ -89,7 +112,7 @@ class Debate:
         on_event: Callable[[DebateEvent], None] | None = None,
         on_agent_event: Callable[[Role, AgentEvent], None] | None = None,
         on_round_start: Callable[[int], Awaitable[None]] | None = None,
-        on_deadlock: Callable[[DebateResult], Awaitable[str]] | None = None,
+        on_deadlock: Callable[[DebateResult], Awaitable[Ruling | str]] | None = None,
         turn_timeout: float | None = None,
     ) -> None:
         self.task = task
@@ -118,6 +141,16 @@ class Debate:
         self._injections: list[str] = []
         #: Rounds where the critic has already been sent its verdict back once.
         self._proved: set[int] = set()
+        #: Complaints a human dismissed at a deadlock. Struck on sight for the
+        #: rest of the run — without this the same argument simply comes back.
+        self._struck: dict[str, Issue] = {}
+        #: Issues a human upheld, owed to the solver as binding instructions for
+        #: exactly one turn.
+        self._upheld: list[Issue] = []
+        #: Rounds whose complaints were *all* struck. Such a round must not read
+        #: as agreement: consensus is what opens the merge dialog, and nobody
+        #: approved anything here.
+        self._emptied: set[int] = set()
         #: Whether the softer of the referee's two approval rules has been spent.
         self._challenged = False
 
@@ -189,6 +222,7 @@ class Debate:
             critique = await self._critique(current, previous_critique, solver_turn)
             if critique is None:
                 return self._finish(Outcome.FAILED, "the critic produced no usable verdict")
+            emptied = current.number in self._emptied
 
             assessment = self.referee.judge(
                 critique, previous=previous_critique, solver=solver_turn
@@ -204,11 +238,19 @@ class Debate:
                 )
             )
 
-            if assessment.settled:
+            # Striking may not manufacture an agreement. An emptied open set
+            # under REQUEST_CHANGES settles the referee, and consensus is what
+            # opens the merge dialog — over work this critic never approved.
+            # Only a set that was already empty may end the argument.
+            if assessment.settled and not emptied:
                 return self._finish(Outcome.CONSENSUS, assessment.reason)
 
-            if assessment.deadlocked:
-                return await self._resolve_deadlock(current, critique)
+            if assessment.deadlocked and not emptied:
+                if (ending := await self._resolve_deadlock(current, critique)) is not None:
+                    return ending
+                # Ruled issue by issue: `critique` now holds only what was
+                # upheld, and the loop tail below sends it to the solver as it
+                # sends any other round's open issues.
 
             if not critique.open_issues:
                 # An approval the critic would not substantiate, even after being
@@ -263,11 +305,25 @@ class Debate:
 
     async def _rebut(self, rnd: Round, issues: list[Issue]) -> SolverTurn | None:
         final = self._is_final_round(rnd.number)
+        if self._upheld:
+            # A person ruled on these, so this turn answers them rather than the
+            # critic. Binding for exactly one turn: the argument resumes after.
+            prompt = arbitrated_prompt(
+                self._upheld,
+                list(self._struck.values()),
+                language=self.language,
+                rigor=self.rigor,
+            )
+            self._upheld = []
+        else:
+            prompt = rebut_prompt(
+                issues, final=final, language=self.language, rigor=self.rigor
+            )
         result = await self._turn(
             Role.REBUT,
             self.solver,
             self._solver_session,
-            rebut_prompt(issues, final=final, language=self.language, rigor=self.rigor),
+            prompt,
             access=self.solver_access,
             schema=SOLVER_SCHEMA,
             round_no=rnd.number,
@@ -333,9 +389,35 @@ class Debate:
 
         if critique is not None:
             critique = await self._prove(rnd, critique, solver)
+            self._strike(rnd, critique)
 
         rnd.critic = critique
         return critique
+
+    def _strike(self, rnd: Round, critique: CriticTurn) -> bool:
+        """Drop what a human already dismissed, and say whether any were.
+
+        Runs before anyone judges, deliberately: `Referee._track_progress`
+        fingerprints `open_issues`, so a set filtered after judging would have
+        every round look stalled against a complaint that no longer counts.
+        """
+
+        if not self._struck or not critique.issues:
+            return False
+        kept = [i for i in critique.issues if i.fingerprint not in self._struck]
+        dropped = [i for i in critique.issues if i.fingerprint in self._struck]
+        if dropped and not kept:
+            self._emptied.add(rnd.number)
+        for issue in dropped:
+            note = f"[{issue.id}] struck — you dismissed this at the deadlock"
+            rnd.notes.append(note)
+            self._emit(
+                DebateEvent(
+                    kind="note", round=rnd.number, engine=self.critic.name, text=note
+                )
+            )
+        critique.issues = kept
+        return bool(dropped)
 
     async def _prove(
         self, rnd: Round, critique: CriticTurn, solver: SolverTurn
@@ -449,8 +531,19 @@ class Debate:
 
     # --- endings ----------------------------------------------------------
 
-    async def _resolve_deadlock(self, rnd: Round, critique: CriticTurn) -> DebateResult:
-        """Both sides are repeating themselves. Stop and decide who prevails."""
+    async def _resolve_deadlock(
+        self, rnd: Round, critique: CriticTurn
+    ) -> DebateResult | None:
+        """Both sides are repeating themselves. Ask, then carry on.
+
+        Returns the run's ending, or `None` meaning the argument continues —
+        which is the whole point of asking a person. A ruling is not a verdict
+        on the run, it is evidence the run did not have: the issues upheld go
+        back to the solver as binding instructions, the dismissed ones leave the
+        argument for good, and the critic reviews what comes back. A run that
+        was going to end in disagreement can now end in agreement, which is also
+        the only way it is ever offered a merge.
+        """
 
         pending = self._finish(
             Outcome.DEADLOCK,
@@ -459,11 +552,42 @@ class Debate:
             critique,
         )
 
-        policy = self.deadlock_policy
-        if policy == "ask" and self.on_deadlock is not None:
-            policy = await self.on_deadlock(pending)
+        if self.deadlock_policy != "ask" or self.on_deadlock is None:
+            return await self._apply_policy(self.deadlock_policy, pending, rnd, critique)
 
-        return await self._apply_policy(policy, pending, rnd, critique)
+        ruling = as_ruling(await self.on_deadlock(pending), critique.open_issues)
+        dismissed = [
+            issue
+            for issue in critique.open_issues
+            if ruling.get(issue.fingerprint) == "solver"
+        ]
+        for issue in dismissed:
+            self._struck[issue.fingerprint] = issue
+        self._strike(rnd, critique)
+        upheld = list(critique.open_issues)
+
+        if not upheld:
+            return self._finish(
+                Outcome.CONSENSUS,
+                "you dismissed every open issue; the solver's work stands",
+            )
+
+        self._upheld = upheld
+        # A stall is a fact about rounds in which nobody moved, and this moved.
+        # Without forgetting it the very next round is still stale and lands
+        # straight back here.
+        self.referee.forget_progress()
+        self._emit(
+            DebateEvent(
+                kind="note",
+                round=rnd.number,
+                text=(
+                    f"you upheld {len(upheld)} of {len(upheld) + len(dismissed)}; "
+                    "the solver must apply them"
+                ),
+            )
+        )
+        return None
 
     async def _wrap_up(
         self, outcome: Outcome, reason: str, rnd: Round, critique: CriticTurn
@@ -473,7 +597,15 @@ class Debate:
         pending = self._finish(outcome, reason, critique)
         policy = self.deadlock_policy
         if policy == "ask" and self.on_deadlock is not None:
-            policy = await self.on_deadlock(pending)
+            # No rounds or money left, so there is nothing to continue into: a
+            # per-issue ruling collapses to "is anything left to apply?".
+            ruling = as_ruling(await self.on_deadlock(pending), critique.open_issues)
+            critique.issues = [
+                issue
+                for issue in critique.open_issues
+                if ruling.get(issue.fingerprint) != "solver"
+            ]
+            policy = "critic" if critique.issues else "solver"
         return await self._apply_policy(policy, pending, rnd, critique)
 
     async def _apply_policy(

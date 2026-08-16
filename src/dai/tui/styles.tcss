@@ -227,35 +227,150 @@ DeadlockScreen {
 }
 
 DeadlockScreen > Vertical {
-    width: 80%;
-    max-width: 96;
-    max-height: 80%;
+    width: 90%;
+    max-width: 108;
+    height: auto;
+    max-height: 90%;
     padding: 1 2;
     background: $surface;
     border: round $warning;
 }
 
-DeadlockScreen .title {
-    text-style: bold;
-    color: $warning;
-}
-
-/* A Horizontal is 1fr tall by default, which stretches an auto-height card
-   down the whole screen. The button rows are as tall as their buttons. */
-DeadlockScreen > Vertical > Horizontal,
-ConfirmQuitScreen > Vertical > Horizontal {
+#deadlock-outcome,
+#deadlock-title,
+#deadlock-lede {
     height: auto;
 }
 
-DeadlockScreen Button {
-    margin: 0 1 0 0;
+#deadlock-title,
+#deadlock-lede {
+    margin: 1 0 0 0;
+}
+
+#deadlock-lede {
+    color: $dai-muted;
+    border-bottom: solid $dai-rule;
+    padding: 0 0 1 0;
 }
 
 #deadlock-issues {
     height: auto;
-    max-height: 12;
-    margin: 1 0;
     scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-color: $dai-rule;
+    scrollbar-color-hover: $dai-muted;
+    scrollbar-color-active: $dai-solver;
+}
+
+IssueRow {
+    height: auto;
+    padding: 0 1;
+    border-bottom: solid $dai-rule;
+}
+
+/* The action bar draws its own top rule; two in a row reads as a mistake. */
+IssueRow:last-of-type {
+    border-bottom: none;
+}
+
+IssueRow.-cursor {
+    background: $dai-highlight;
+}
+
+.issue-line {
+    height: auto;
+    padding: 1 0;
+}
+
+.issue-headline {
+    height: auto;
+    padding: 1 0 0 0;
+}
+
+.issue-evidence {
+    height: auto;
+}
+
+/* The one Horizontal on this screen that must NOT be auto: it holds the two
+   argument panes and has to fill the row so they can split it evenly. */
+.issue-sides {
+    height: auto;
+    margin: 1 0;
+}
+
+.issue-side {
+    width: 1fr;
+    height: auto;
+    margin: 0 1 0 0;
+    padding: 1;
+    border: round $dai-rule;
+}
+
+.side-who {
+    height: auto;
+}
+
+/* `min-height`, not a fixed one: each side sizes to its own prose, so an
+   argument a line longer than the other would leave the two buttons at
+   different heights — which reads as one option weighing more than the other.
+   A floor lines them up for the lengths these actually run to, and still lets
+   a long one grow rather than be cut. `height: 100%` is not the answer here:
+   inside an auto-height parent it is circular, and both panels come out empty. */
+.side-says {
+    height: auto;
+    min-height: 3;
+    margin: 1 0;
+}
+
+.issue-side Button {
+    width: 1fr;
+    min-width: 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#deadlock-actions {
+    border-top: solid $dai-rule;
+}
+
+#deadlock-go {
+    width: 20;
+    min-width: 20;
+    max-width: 20;
+    margin: 0 1 0 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#deadlock-left {
+    width: 1fr;
+    min-width: 0;
+    height: 3;
+    content-align: left middle;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#deadlock-footnote {
+    height: auto;
+    margin: 1 0 0 0;
+    color: $dai-muted;
+}
+
+/* Too short for prose: fold away what is not the question. */
+DeadlockScreen.-short #deadlock-lede,
+DeadlockScreen.-short #deadlock-footnote {
+    display: none;
+}
+
+/* A Horizontal is 1fr tall by default, which stretches an auto-height card
+   down the whole screen. The button rows are as tall as their buttons.
+   DeadlockScreen is deliberately absent: its `.issue-sides` row is the one
+   place two panes really do have to share the width. */
+ConfirmQuitScreen > Vertical > Horizontal,
+MergeScreen > Vertical > Horizontal,
+#deadlock-actions {
+    height: auto;
 }
 
 ConfirmQuitScreen {
@@ -278,4 +393,137 @@ ConfirmQuitScreen .title {
 
 ConfirmQuitScreen Button {
     margin: 1 1 0 0;
+}
+
+/* --- the merge screen -------------------------------------------------- */
+
+MergeScreen {
+    align: center middle;
+}
+
+MergeScreen > Vertical {
+    width: 80%;
+    max-width: 96;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: round $dai-rule;
+}
+
+/* Auto rather than a fixed row: in a narrow terminal these sentences wrap, and
+   a card that grows is better than a sentence that stops mid-word. The card
+   has its own max-height, and the rows below scroll, so nothing runs away. */
+#merge-outcome,
+#merge-title {
+    height: auto;
+}
+
+#merge-title,
+#merge-lede {
+    margin: 1 0 0 0;
+}
+
+#merge-lede {
+    height: auto;
+    color: $dai-muted;
+}
+
+/* The hairline over the list is this line's own bottom border, the way the
+   header and the footer draw theirs — one less widget, and it follows the
+   theme with nothing of ours redrawing it. */
+#merge-from {
+    height: auto;
+    border-bottom: solid $dai-rule;
+}
+
+/* No max-height here: `MergeScreen._fit` owns it, because the cap has to be
+   whatever the rest of the card is not using. A number in the sheet cannot
+   know that, and the card clips rather than scrolls when it is wrong — which
+   costs you the button and the way out, not a row. */
+#merge-rows {
+    height: auto;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-color: $dai-rule;
+    scrollbar-color-hover: $dai-muted;
+    scrollbar-color-active: $dai-solver;
+}
+
+/* Two lines of content and the gap under them, so the cursor reads as a band
+   rather than a stripe — and so a row can never grow a third line. */
+RepoRow {
+    width: 1fr;
+    height: 3;
+    padding: 0 1;
+}
+
+/* The last row hands its gap to the rule below it. */
+RepoRow:last-of-type {
+    height: 2;
+}
+
+RepoRow.-cursor {
+    background: $dai-highlight;
+}
+
+#merge-actions {
+    border-top: solid $dai-rule;
+}
+
+/* One width for both, set rather than derived. `auto` sizes each control to its
+   own label, and an `fr` split has to give its remainder to one of them —
+   neither can be even at every terminal size, and a number can. 24 holds
+   "Merge 12 selected"; anything longer is cut rather than wrapped, since a
+   second line would push the row past the height it is drawn at.
+   `min-width` has to be said: Button ships 16 and the Cell beside it ships
+   none, which is what made them diverge on a narrow terminal. */
+#merge-go,
+#merge-toggle {
+    width: 24;
+    min-width: 24;
+    max-width: 24;
+    margin: 0 1 0 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+
+/* Cut, never wrapped — wrapping turns this into a three-line esc/Keep/the
+   column that drags the whole row taller. */
+#merge-keep {
+    width: 1fr;
+    min-width: 0;
+    height: 3;
+    content-align: right middle;
+    text-align: right;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* Too short for prose, or too narrow for the hint: fold away the parts that
+   are not the question, rather than crop the parts that are. */
+MergeScreen.-short #merge-lede,
+MergeScreen.-short #merge-footnote {
+    display: none;
+}
+
+MergeScreen.-narrow #merge-keep {
+    display: none;
+}
+
+/* Still one width for both — narrower, not uneven. Two 24s plus the gap need
+   49 columns, which is more than a 64-column terminal leaves inside the card,
+   and the pill loses its right-hand border first. */
+MergeScreen.-narrow #merge-go,
+MergeScreen.-narrow #merge-toggle {
+    width: 22;
+    min-width: 22;
+    max-width: 22;
+}
+
+#merge-footnote {
+    height: auto;
+    margin: 1 0 0 0;
+    color: $dai-muted;
 }

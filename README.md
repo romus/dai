@@ -21,9 +21,10 @@ rounds or budget run out.
 
 ```bash
 make install        # create the venv, install deps
+make demo           # watch a run without installing the agents or spending anything
 make doctor         # check uv / claude / codex are actually installed
 make init           # write ~/.config/dai/config.toml (annotated)
-make test           # 351 tests
+make test
 
 make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
 ```
@@ -47,15 +48,25 @@ dai --rigor brutal "make the retry logic actually correct"   # easy·standard·s
 dai --lang <language> "pon la documentación al día con el código"
 dai --solver codex --critic claude "refactor the config loader"
 dai --no-tui "regenerate the CLI reference in docs/"
+dai --merge "bring the changelog up to date"      # merge back without asking
 dai --no-merge "bring the changelog up to date"   # leave it on the run's branch
 dai --branch-from current "tidy up the tests"     # branch off where I am, not the trunk
 dai --runs                                        # past runs; --show <id> prints one
 dai --snapshots                                   # branches those runs committed to
+dai --demo                                        # watch a canned run; costs and changes nothing
 ```
 
 From this checkout instead: `make run-here DIR=~/projects/foo ARGS="'the task'"` or
 `uv run dai -C ~/projects/foo "the task"` — every `run` target takes `ARGS`, quoted so
 the task stays one argument.
+
+`dai --demo` plays a canned argument through the real screen: the panes stream, the
+verdicts land, and the keys all work. The two sides deadlock, you rule on each open
+issue, the run carries on from your calls and ends at the merge dialog for you to answer.
+The agents are invented and so are the repositories, so it needs neither `claude` nor
+`codex` installed, spends nothing, and **writes nothing at all** — no files, no commits,
+no transcript. It is the cheapest way to see what a run looks like, and the only way to
+see the two decisions that a real run has to earn.
 
 In a repository you care about, start with `--dry-run`: both agents go read-only and
 you get their proposals instead. `make smoke` runs a real argument in a throwaway
@@ -74,7 +85,12 @@ Solver on the left, critic on the right, verdicts along the bottom.
 | `i` | say something to the agents — it outranks both |
 | `a` | accept the work as it stands and stop |
 
-On a deadlock the run pauses and asks who prevails.
+On a deadlock the run pauses and asks — issue by issue, showing you the critic's
+complaint beside the solver's answer to it. What you uphold goes back to the solver as
+binding instructions and what you dismiss leaves the argument for good, so the run
+carries on from there and can still end in agreement. `←`/`→` rule the issue under the
+cursor, `↑`/`↓` move without ruling, `Enter` continues once every one is decided, and
+`Esc` hands whatever is left to the configured default.
 
 The task box and the `i` box take more than one line: `Enter` sends, `Shift+Enter`
 breaks the line — or `Ctrl+J` / `Alt+Enter` in terminals that don't speak the kitty
@@ -92,7 +108,7 @@ mid-run theme change on terminals that report one. `--theme dark|light` pins one
 
 `~/.config/dai/config.toml`, created by `make init`, every option commented. Defaults:
 `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to the critic,
-per-round commits on, merged back into your branch on agreement. `rigor` sets how hard
+per-round commits on, and on agreement you are asked what to merge. `rigor` sets how hard
 the two lean on each other — the evidence rules hold at every level, it is how far the
 critic hunts and how hard the solver defends; above `standard`, expect more rounds and
 more spend.
@@ -107,7 +123,7 @@ completion_debounce_ms = 80   # delay before the @ list refilters; 0 disables it
 
 [snapshot]
 branch_from = "default"       # the trunk; or "current", or a branch name
-merge = true                  # on agreement, fast-forward that branch onto the work
+merge = "ask"                 # on agreement: "ask" · true (just do it) · false (never)
 ```
 
 ## Branches and commits
@@ -116,8 +132,19 @@ A repository the agents change is moved onto `dai/<run-id>`, rooted on whatever 
 would merge back into — `main`/`master` by default. Each round lands there as an
 ordinary commit, and at consensus that base branch is fast-forwarded onto the result,
 leaving you on your own branch with the work committed and `git status` clean. Only
-consensus merges: a deadlock, a run out of budget or one you killed leaves you on
-`dai/<run-id>` instead.
+consensus merges: a run out of budget or one you killed leaves you on `dai/<run-id>`
+instead — as does a deadlock you were not there to rule on.
+
+By default dai asks first. On agreement it shows you every repository that changed —
+what it would merge into, how many lines either way, and which files — and merges the
+ones you tick; in a plain terminal the same thing is a `[y/N]` question. Nothing is
+written until you answer, and every branch survives whichever way you answer. Piped or
+redirected, with nobody to ask, nothing is merged and the report says so. `merge = true`
+skips the question, `merge = false` never merges at all.
+
+A repository whose base branch moved while the agents were working is refused whatever
+you say — the reason names the file that landed there — and stays on `dai/<run-id>`,
+yours to merge by hand.
 
 **Repositories nothing changed in are not touched at all.** Whatever was uncommitted
 before you started is kept as a `baseline` commit of its own. Not one file on disk is

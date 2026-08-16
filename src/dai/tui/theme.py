@@ -196,6 +196,10 @@ def _theme(name: str, palette: Palette, *, dark: bool) -> Theme:
             "dai-muted": palette.muted,
             "dai-solver": palette.solver,
             "dai-critic": palette.critic,
+            # The row the cursor is on, on the merge screen. The same tint the
+            # `@` list wears below, but the sheet cannot reach it there without
+            # calling itself a block cursor, which it is not.
+            "dai-highlight": palette.highlight,
             # Textual's own Footer, dressed as the keycap row in the design.
             "footer-background": "transparent",
             "footer-item-background": "transparent",
