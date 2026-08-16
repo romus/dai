@@ -9,10 +9,16 @@ from __future__ import annotations
 
 from dai.models import Action, Severity, SolverTurn, Verdict
 from dai.protocol import (
+    RIGOR,
+    STANDARD,
+    critique_first_prompt,
+    critique_next_prompt,
     parse_critic,
     parse_solver,
+    prove_prompt,
     rebut_prompt,
     render_responses,
+    rigor_rule,
     solve_prompt,
 )
 
@@ -152,7 +158,12 @@ def test_solve_prompt_carries_the_task_verbatim():
 def test_every_prompt_pins_the_reply_language():
     """A live run answered an English task in Spanish; the rule must be explicit."""
 
-    for prompt in (solve_prompt("t"), rebut_prompt([]), rebut_prompt([], final=True)):
+    for prompt in (
+        solve_prompt("t"),
+        rebut_prompt([]),
+        rebut_prompt([], final=True),
+        prove_prompt("it named nothing"),
+    ):
         assert "SAME language" in prompt
         assert "do not switch language mid-argument" in prompt
 
@@ -181,6 +192,108 @@ def test_unanswered_issues_are_shown_as_ignored():
     assert "NO ANSWER" in rendered
 
 
+def test_the_approval_bar_is_restated_every_round():
+    """It used to be stated in round one only — and rounds two and later are
+    exactly where an agreeable critic waves the work through."""
+
+    for prompt in (
+        critique_first_prompt("t", SolverTurn()),
+        critique_next_prompt(2, [], SolverTurn()),
+    ):
+        assert "`checked` names nothing" in prompt
+
+
+def test_the_critic_is_told_what_an_artifact_looks_like():
+    """`checked: ["reviewed the changes"]` satisfied every rule there was."""
+
+    prompt = critique_first_prompt("t", SolverTurn())
+
+    assert "file:line" in prompt
+    assert "is not an entry" in prompt
+
+
+def test_the_critic_is_told_to_keep_its_claims_word_for_word():
+    """The referee fingerprints claim text. Reword a surviving complaint and a
+    stalled argument reads as progress, so deadlock never fires."""
+
+    prompt = critique_next_prompt(2, [], SolverTurn())
+
+    assert "word for word" in prompt
+    assert "`conceded`" in prompt
+
+
+def test_approving_is_still_a_legitimate_outcome():
+    """Trading a rubber stamp for a critic that never approves is not a fix."""
+
+    assert "is a good review" in critique_first_prompt("t", SolverTurn())
+
+
+def test_the_later_critic_sees_what_the_solver_now_reports():
+    """From round two it was told what the solver answered, never what it did."""
+
+    prompt = critique_next_prompt(2, [], SolverTurn(files_changed=["src/parse.py"]))
+
+    assert "src/parse.py" in prompt
+
+
+def test_the_solver_may_not_claim_a_fix_it_did_not_make():
+    prompt = rebut_prompt(parse_critic(critique()).issues)
+
+    assert "Do not mark FIXED anything you did not just change" in prompt
+
+
+def test_the_final_round_records_forced_changes():
+    """A change applied under the deadlock policy is not a change of mind."""
+
+    assert "which changes were forced" in rebut_prompt([], final=True)
+
+
+def test_the_reask_names_what_was_wrong_with_the_approval():
+    prompt = prove_prompt("it named nothing you examined.")
+
+    assert "was not accepted: it named nothing you examined." in prompt
+    assert "verdict object only" in prompt
+
+
+# --- rigor ----------------------------------------------------------------
+
+
+def test_every_rigor_level_reaches_both_roles():
+    """The complaint was that review was toothless — for both sides of it."""
+
+    for level in RIGOR:
+        critic_rule = rigor_rule(level, critic=True)
+        solver_rule = rigor_rule(level, critic=False)
+
+        assert critic_rule in critique_first_prompt("t", SolverTurn(), rigor=level)
+        assert critic_rule in critique_next_prompt(2, [], SolverTurn(), rigor=level)
+        assert solver_rule in solve_prompt("t", rigor=level)
+        assert solver_rule in rebut_prompt([], rigor=level)
+
+
+def test_the_two_sides_are_not_handed_the_same_paragraph():
+    """A critic told to attack while the solver is told to please it produces
+    capitulation, not agreement."""
+
+    assert rigor_rule("brutal", critic=True) != rigor_rule("brutal", critic=False)
+
+
+def test_an_unknown_rigor_falls_back_to_standard():
+    """A typo in a config file should cost the run its harshness, not the run."""
+
+    assert rigor_rule("ferocious", critic=True) == rigor_rule(STANDARD, critic=True)
+    assert rigor_rule("", critic=False) == rigor_rule(STANDARD, critic=False)
+
+
+def test_the_evidence_bar_does_not_move_with_the_rigor():
+    """If `easy` could waive it, `easy` would be the rubber stamp we removed."""
+
+    for level in RIGOR:
+        assert "`checked` names nothing" in critique_first_prompt(
+            "t", SolverTurn(), rigor=level
+        )
+
+
 # --- language -------------------------------------------------------------
 
 
@@ -206,14 +319,13 @@ def test_a_pinned_language_overrides_the_task_language():
 
 
 def test_pinned_language_reaches_every_role():
-    from dai.protocol import critique_first_prompt, critique_next_prompt
-
     prompts = [
         solve_prompt("t", language="Spanish"),
         rebut_prompt([], language="Spanish"),
         rebut_prompt([], final=True, language="Spanish"),
         critique_first_prompt("t", SolverTurn(), language="Spanish"),
         critique_next_prompt(2, [], SolverTurn(), language="Spanish"),
+        prove_prompt("it named nothing", language="Spanish"),
     ]
 
     assert all("in Spanish" in p for p in prompts)

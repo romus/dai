@@ -15,6 +15,7 @@ from dai.consensus import Referee
 from dai.engines import Engine, build_engine
 from dai.models import AgentEvent, Outcome, Role
 from dai.orchestrator import Debate, DebateEvent, DebateResult
+from dai.protocol import RIGOR
 from dai.snapshot import (
     Snapshotter,
     describe,
@@ -50,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="both agents read-only; nothing on disk is modified",
+    )
+    parser.add_argument(
+        "--rigor",
+        choices=RIGOR,
+        help="how hard the two lean on each other when reviewing",
     )
     parser.add_argument("--lang", help='language the agents argue in; "auto" follows the task')
     parser.add_argument(
@@ -158,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         deadlock_policy=cfg.deadlock_policy,
         language=cfg.language,
+        rigor=cfg.rigor,
         solver_writes=not args.dry_run,
         turn_timeout=cfg.turn_timeout,
     )
@@ -218,6 +225,8 @@ def _apply_overrides(cfg: Config, args) -> Config:
         cfg.critic = args.critic
     if args.policy:
         cfg.deadlock_policy = args.policy
+    if args.rigor:
+        cfg.rigor = args.rigor
     if args.lang:
         cfg.language = args.lang
     if getattr(args, "theme", None):

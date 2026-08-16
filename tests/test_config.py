@@ -30,6 +30,7 @@ def test_the_shipped_default_config_parses_and_matches_the_dataclass_defaults(tm
     assert cfg.limits.max_rounds == 5
     assert cfg.limits.max_usd == 5.0
     assert cfg.deadlock_policy == "critic"
+    assert cfg.rigor == "standard"
     assert cfg.no_progress_rounds == 2
     assert cfg.stop_on_minor_only is True
     assert cfg.snapshot.enabled is True
@@ -194,6 +195,21 @@ def test_absent_flags_leave_config_values_alone():
 
     assert cfg.limits.max_rounds == 7
     assert cfg.solver == "claude"
+
+
+def test_rigor_defaults_to_standard_and_can_be_raised():
+    assert from_dict({}).rigor == "standard"
+    assert _apply_overrides(from_dict({}), parse("t", "--rigor", "brutal")).rigor == "brutal"
+
+
+def test_a_rigor_nobody_recognises_is_read_as_standard():
+    """A typo in a config file should cost the run its harshness, not the run."""
+
+    assert from_dict({"critique": {"rigor": "ferocious"}}).rigor == "standard"
+    assert from_dict({"critique": {"rigor": "BRUTAL"}}).rigor == "brutal"
+
+    with pytest.raises(SystemExit):  # the flag, unlike the file, refuses outright
+        parse("t", "--rigor", "ferocious")
 
 
 def test_policy_flag_is_constrained_to_known_values():
