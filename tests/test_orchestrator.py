@@ -255,7 +255,84 @@ async def test_ask_policy_defers_to_the_host(tmp_path):
     result = await d.run()
 
     assert asked == [Outcome.DEADLOCK]
-    assert "solver's version stands" in result.reason
+    # A bare side is still an answer, and "solver" dismisses every open issue.
+    # Nothing is left to fix, so the argument is over — and it is over by
+    # agreement, which is the only ending that is offered a merge.
+    assert result.outcome is Outcome.CONSENSUS
+    assert "you dismissed every open issue" in result.reason
+
+
+async def test_a_ruling_sends_the_upheld_issues_back_into_the_argument(tmp_path):
+    """The point of asking: your call is evidence, not a verdict on the run."""
+
+    async def decide(pending):
+        return {issue.fingerprint: "critic" for issue in pending.open_issues}
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved()] + [solved(responses=replies(("i1", "REJECTED"))) for _ in range(4)],
+        # Three identical critiques to stall the referee, then it approves the
+        # work the ruling forced — which is the ending the whole change is for.
+        [changes("same complaint") for _ in range(3)] + [approve()],
+        referee=Referee(no_progress_rounds=2),
+        deadlock_policy="ask",
+        on_deadlock=decide,
+    )
+
+    result = await d.run()
+
+    assert result.outcome is Outcome.CONSENSUS, result.reason
+    # The solver was told it was answering a person, not the critic.
+    assert any("ruled on it, issue by issue" in p for p in solver.prompts)
+    assert any("DISMISSED" in p for p in solver.prompts), "the closed half went unsaid"
+
+
+async def test_a_dismissed_issue_is_struck_if_the_critic_files_it_again(tmp_path):
+    """Your word outranks the critic's, or the same argument comes straight back."""
+
+    async def decide(pending):
+        return {issue.fingerprint: "solver" for issue in pending.open_issues[:1]}
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved()] + [solved(responses=replies(("i1", "REJECTED"), ("i2", "REJECTED")))
+                      for _ in range(4)],
+        [changes("dismissed one", "upheld one") for _ in range(4)] + [approve()],
+        referee=Referee(no_progress_rounds=2),
+        deadlock_policy="ask",
+        on_deadlock=decide,
+    )
+
+    await d.run()
+
+    struck = [note for rnd in d.rounds for note in rnd.notes if "struck" in note]
+
+    assert struck, "the dismissed complaint was allowed back into the argument"
+    assert "you dismissed this at the deadlock" in struck[0]
+
+
+async def test_striking_never_manufactures_an_agreement(tmp_path):
+    """Consensus opens the merge dialog. Only the critic may grant it."""
+
+    async def decide(pending):
+        return {issue.fingerprint: "solver" for issue in pending.open_issues}
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved()] + [solved(responses=replies(("i1", "REJECTED"))) for _ in range(4)],
+        # After the ruling the critic re-files the very complaint that was
+        # dismissed, so striking empties the set under REQUEST_CHANGES.
+        [changes("same complaint") for _ in range(5)],
+        referee=Referee(no_progress_rounds=2),
+        deadlock_policy="ask",
+        on_deadlock=decide,
+    )
+
+    result = await d.run()
+
+    # It may end however it likes, but not by claiming the critic agreed to
+    # something it never approved — unless that was the ruling itself.
+    assert result.outcome is not Outcome.CONSENSUS or "you dismissed" in result.reason
 
 
 # --- limits ---------------------------------------------------------------

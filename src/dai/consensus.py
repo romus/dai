@@ -128,6 +128,18 @@ class Referee:
 
     # --- internals --------------------------------------------------------
 
+    def forget_progress(self) -> None:
+        """Wipe the stall. Something moved that the rounds alone cannot show.
+
+        A deadlock is "the same complaints, round after round". When a person
+        rules on those complaints the set genuinely changes, but the evidence of
+        that arrives from outside the argument — so the referee has to be told,
+        or it goes on counting a stall that is over.
+        """
+
+        self._stalled_rounds = 0
+        self._fingerprints.clear()
+
     def _track_progress(self, critic: CriticTurn) -> None:
         """A round counts as progress if the set of live complaints moved."""
 

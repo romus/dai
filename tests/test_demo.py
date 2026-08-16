@@ -19,7 +19,7 @@ from dai.demo.fiction import BRANCH, PretendSnapshotter, candidates
 from dai.demo.script import CRITIQUES, SOLVES
 from dai.models import Access, Outcome
 from dai.transcript import Transcript
-from dai.tui.app import MergeScreen
+from dai.tui.app import DeadlockScreen, MergeScreen
 from dai.tui.widgets import RepoRow, VerdictLog
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,12 +38,26 @@ def demo_app(cwd: Path) -> tuple[DaiApp, PretendSnapshotter]:
     return app, snapshotter
 
 
-async def reach_the_merge(app, tries: int = 200):
+async def reach(app, screen, tries: int = 300):
     for _ in range(tries):
-        if isinstance(app.screen, MergeScreen):
+        if isinstance(app.screen, screen):
             return app.screen
         await asyncio.sleep(0.05)
-    raise AssertionError("the demo never reached the merge dialog")
+    raise AssertionError(f"the demo never reached {screen.__name__}")
+
+
+async def rule_the_deadlock(app, pilot, side: str = "left"):
+    """Settle every open issue, then continue — the demo's first act."""
+
+    screen = await reach(app, DeadlockScreen)
+    for _ in range(len(screen.cases)):
+        await pilot.press(side)
+    await pilot.press("enter")
+    return screen
+
+
+async def reach_the_merge(app, tries: int = 300):
+    return await reach(app, MergeScreen, tries)
 
 
 async def settled(app, tries: int = 120) -> None:
@@ -66,6 +80,7 @@ async def test_the_demo_writes_absolutely_nothing(tmp_path):
     app, _ = demo_app(tmp_path)
 
     async with app.run_test() as pilot:
+        await rule_the_deadlock(app, pilot)
         await reach_the_merge(app)
         await pilot.press("enter")  # the destructive answer, on purpose
         await settled(app)
@@ -96,6 +111,7 @@ async def test_the_demo_reaches_the_merge_dialog(tmp_path):
     app, snapshotter = demo_app(tmp_path)
 
     async with app.run_test() as pilot:
+        await rule_the_deadlock(app, pilot)
         screen = await reach_the_merge(app)
         rows = [row.candidate for row in screen.query(RepoRow)]
 
@@ -116,6 +132,7 @@ async def test_choosing_to_merge_runs_the_real_path_over_the_fiction(tmp_path):
     app, snapshotter = demo_app(tmp_path)
 
     async with app.run_test() as pilot:
+        await rule_the_deadlock(app, pilot)
         await reach_the_merge(app)
         await pilot.press("enter")
         await settled(app)

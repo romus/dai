@@ -14,9 +14,9 @@ from textual.app import ComposeResult, RenderResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
-from textual.widgets import Label, RichLog, Static
+from textual.widgets import Button, Label, RichLog, Static
 
-from dai.models import AgentEvent, CriticTurn, Severity, Verdict
+from dai.models import AgentEvent, CriticTurn, Issue, Severity, Verdict
 from dai.snapshot import MergeCandidate
 from dai.tui import theme
 from dai.tui.theme import spaced
@@ -340,6 +340,135 @@ class AgentPane(Vertical):
     def _shorten(self, text: str, width: int = 120) -> str:
         shown = str(text).replace(f"{self.cwd}/", "").replace(str(self.cwd), ".")
         return shown if len(shown) <= width else shown[: width - 1] + "…"
+
+
+@dataclass(frozen=True)
+class IssueCase:
+    """One open issue and both sides of it, worked out before the screen opens.
+
+    The critic's half is its own claim; the solver's is the `detail` of the
+    reply it filed against that claim. Joining those two is fiddly enough — the
+    solver answers the *previous* round's ids, so the join is by fingerprint —
+    that it happens once, outside the widget, and what arrives here is prose.
+    """
+
+    issue: Issue
+    critic_says: str
+    solver_says: str
+
+
+class IssueRow(Vertical):
+    """One open issue: a line when it is settled, the whole argument when it is not.
+
+    A container rather than a `Static`, because the expanded form carries the
+    two buttons that settle it. Only the row under the cursor is ever expanded,
+    which is what keeps those button ids unique on the screen.
+    """
+
+    at_cursor: reactive[bool] = reactive(False)
+    ruling: reactive[str] = reactive("")
+
+    class Ruled(Message):
+        def __init__(self, row: IssueRow, side: str) -> None:
+            self.row = row
+            self.side = side
+            super().__init__()
+
+    def __init__(self, case: IssueCase, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.case = case
+
+    def watch_at_cursor(self, on: bool) -> None:
+        self.set_class(on, "-cursor")
+        self._redraw()
+
+    def watch_ruling(self, _side: str) -> None:
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if self.is_mounted:
+            self.refresh(recompose=True)
+
+    def compose(self) -> ComposeResult:
+        if self.at_cursor:
+            yield from self._expanded()
+        else:
+            yield Cell(self._collapsed, classes="issue-line")
+
+    # --- the two forms ----------------------------------------------------
+
+    def _collapsed(self) -> Table:
+        issue = self.case.issue
+        row = Table.grid(expand=True)
+        row.add_column(width=5, no_wrap=True)
+        row.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        row.add_column(width=2, no_wrap=True)
+        row.add_column(justify="right", no_wrap=True)
+        row.add_row(
+            Text(f" {issue.id}".ljust(5), style=theme.S_MUTED),
+            Text(issue.claim, style=theme.S_MUTED if self.ruling else theme.S_TEXT),
+            "",
+            self._verdict(),
+        )
+        return row
+
+    def _verdict(self) -> Text:
+        if not self.ruling:
+            return Text("undecided", style=theme.S_MUTED)
+        line = Text()
+        line.append(f"{self.ruling} wins ", style=theme.S_MUTED)
+        line.append("✓", style=theme.color("success"))
+        return line
+
+    def _expanded(self) -> ComposeResult:
+        yield Cell(self._headline, classes="issue-headline")
+        if self.case.issue.evidence:
+            yield Cell(self._evidence, classes="issue-evidence")
+        with Horizontal(classes="issue-sides"):
+            with Vertical(classes="issue-side"):
+                yield Cell(lambda: self._side("CRITIC SAYS", "critic"), classes="side-who")
+                yield Cell(lambda: self._says(self.case.critic_says), classes="side-says")
+                yield Button("←  Critic is right", variant="primary", id="rule-critic")
+            with Vertical(classes="issue-side"):
+                yield Cell(lambda: self._side("SOLVER SAYS", "solver"), classes="side-who")
+                yield Cell(lambda: self._says(self.case.solver_says), classes="side-says")
+                yield Button("→  Solver is right", id="rule-solver")
+
+    def _headline(self) -> Table:
+        issue = self.case.issue
+        row = Table.grid(expand=True)
+        row.add_column(width=5, no_wrap=True)
+        row.add_column(ratio=1, overflow="ellipsis")
+        row.add_column(width=2, no_wrap=True)
+        row.add_column(justify="right", no_wrap=True)
+        row.add_row(
+            Text(f" {issue.id}".ljust(5), style=theme.SOLVER),
+            Text(issue.claim, style=theme.style("strong")),
+            "",
+            Text(
+                f"( {issue.severity.value.upper()} )",
+                style=theme.style(_SEVERITY_STYLE[issue.severity]),
+            ),
+        )
+        return row
+
+    def _evidence(self) -> Text:
+        return Text(f"     {self.case.issue.evidence}", style=theme.S_MUTED)
+
+    def _side(self, label: str, role: str) -> Text:
+        line = Text()
+        line.append("● ", style=theme.color(role))
+        line.append(spaced(label), style=theme.S_MUTED)
+        return line
+
+    def _says(self, words: str) -> Text:
+        return Text(words or "said nothing about this one", style=theme.S_TEXT)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.post_message(
+            self.Ruled(self, "solver" if event.button.id == "rule-solver" else "critic")
+        )
 
 
 class RepoRow(Static):

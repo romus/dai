@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 
+from rich.table import Table
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -24,7 +25,15 @@ from dai.tui import theme
 from dai.tui.appearance import AppearanceChanged, driver_class
 from dai.tui.completion import DEFAULT_DEBOUNCE_MS, CompletingInput
 from dai.tui.theme import apply_theme, hint, spaced
-from dai.tui.widgets import AgentPane, Cell, RepoRow, StatusBar, VerdictLog
+from dai.tui.widgets import (
+    AgentPane,
+    Cell,
+    IssueCase,
+    IssueRow,
+    RepoRow,
+    StatusBar,
+    VerdictLog,
+)
 
 #: How each ending is announced. Style names, not style strings — the palette
 #: they resolve against is whichever the terminal is wearing at the time.
@@ -103,63 +112,240 @@ class InjectScreen(ModalScreen[str]):
         self.dismiss("")
 
 
-class DeadlockScreen(ModalScreen[str]):
-    """Shown when neither side will move. Nothing proceeds until you decide."""
+class DeadlockScreen(ModalScreen[dict]):
+    """Neither side will move. You rule on each complaint, and the run goes on.
 
-    #: Only these are answers; "ask" is the question, not a reply to it.
-    CHOICES = ("critic", "solver")
+    Not a verdict on the run: a ruling is evidence the argument did not have.
+    What you uphold goes back to the solver as binding instructions, what you
+    dismiss leaves the argument for good, and the critic reviews what comes
+    back — so a run headed for disagreement can still end in agreement.
 
-    def __init__(self, result: DebateResult, default: str) -> None:
+    Answers with a `Ruling`: fingerprint -> "critic" | "solver". Fingerprints,
+    not ids, because the answer outlives this critique and ids are renumbered
+    freely between rounds.
+    """
+
+    AUTO_FOCUS = ""
+    MAX_ROWS = 24
+
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (24, "-tall")]
+
+    BINDINGS = [
+        Binding("up,k", "cursor(-1)", "up", show=False),
+        Binding("down,j", "cursor(1)", "down", show=False),
+        Binding("left,c", "rule('critic')", "critic is right"),
+        Binding("right,s", "rule('solver')", "solver is right"),
+        Binding("enter", "carry_on", "continue"),
+        # Consumed here for the same reason MergeScreen consumes it: the app's
+        # `q` would cancel the very worker awaiting this screen.
+        Binding("escape,q", "give_up", "use the default"),
+    ]
+
+    def __init__(self, result: DebateResult, default: str, *, stalled: int = 2) -> None:
         super().__init__()
         self.result = result
-        # policy="ask" is precisely how we got here, so it cannot also be the
-        # pre-selected answer — focusing a button that does not exist crashes
-        # the screen at the moment the user is most needed.
-        self.default = default if default in self.CHOICES else "critic"
+        # "ask" is how we got here, so it cannot also be the fallback.
+        self.default = default if default in ("critic", "solver") else "critic"
+        self.stalled = stalled
+        self.cases = _read_the_argument(result)
+        self.rulings: dict[str, str] = {}
+        self._cursor = 0
+
+    # --- what it says -----------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("They will not converge", classes="title")
-            yield Static(self.result.reason)
-            with VerticalScroll(id="deadlock-issues"):
-                for issue in self.result.open_issues:
-                    line = Text()
-                    line.append(f"[{issue.id}] ", style=theme.S_MUTED)
-                    line.append(f"({issue.severity.value}) ", style=theme.WARNING)
-                    line.append(issue.claim, style=theme.S_TEXT)
-                    yield Static(line)
-                    if issue.evidence:
-                        yield Static(
-                            Text(f"      {issue.evidence}", style=theme.S_MUTED)
-                        )
-            with Horizontal():
-                yield Button("Critic is right", variant="warning", id="critic")
-                yield Button("Solver is right", variant="primary", id="solver")
-            yield Static(
-                Text(
-                    f"default for this run: {self.default} wins",
-                    style=theme.S_MUTED,
-                )
-            )
+        with Vertical(id="deadlock-card"):
+            yield Cell(self._paint_outcome, id="deadlock-outcome")
+            yield Cell(self._paint_title, id="deadlock-title")
+            yield Cell(self._paint_lede, id="deadlock-lede")
+            with _RowList(id="deadlock-issues"):
+                for index, case in enumerate(self.cases):
+                    yield IssueRow(case, id=f"issue-{index}")
+            with Horizontal(id="deadlock-actions"):
+                yield Button(self._go_label(), variant="primary", id="deadlock-go")
+                yield Cell(self._paint_left, id="deadlock-left")
+            yield Cell(self._paint_footnote, id="deadlock-footnote")
 
     def on_mount(self) -> None:
-        self._focus_default()
+        for button in self.query(Button):
+            button.can_focus = False
+        self._sync()
 
-    def repaint(self) -> None:
-        """The issue list bakes its colours in, so a theme change rebuilds it.
+    def on_resize(self, event: events.Resize) -> None:
+        self._fit()
 
-        This screen can sit there for as long as the user takes to decide, so
-        it is the one modal that really can outlive the palette it was drawn in.
+    def _fit(self) -> None:
+        """Same budgeting as the merge screen, and for the same reason.
+
+        The card is `height: auto` under a `max-height`, which clamps without
+        making anything inside give way — and what gets clipped is the bottom,
+        where the way to answer lives.
         """
 
-        self.refresh(recompose=True)
-        self.call_after_refresh(self._focus_default)
+        card = self.query_one("#deadlock-card", Vertical)
+        listing = self.query_one("#deadlock-issues", _RowList)
+        chrome = sum(
+            child.outer_size.height + child.styles.margin.height
+            for child in card.children
+            if child is not listing
+        )
+        budget = (self.size.height * 9) // 10 - 4 - chrome
+        listing.styles.max_height = max(4, min(self.MAX_ROWS, budget))
 
-    def _focus_default(self) -> None:
-        self.query_one(f"#{self.default}", Button).focus()
+    def repaint(self) -> None:
+        """Not `recompose`: it would take the cursor and every ruling with it."""
+
+        for cell in self.query(Cell):
+            cell.refresh()
+        for row in self.query(IssueRow):
+            row.refresh()
+
+    def _paint_outcome(self):
+        colour = theme.color("warning")
+        label = Text()
+        label.append("● ", style=colour)
+        label.append(spaced("DEADLOCK"), style=f"bold {colour}")
+        # A grid rather than padding: the tally has to reach the right edge at
+        # any width, and a `rjust` guessed against the screen wraps instead.
+        row = Table.grid(expand=True)
+        row.add_column(no_wrap=True)
+        row.add_column(justify="right", ratio=1, no_wrap=True)
+        row.add_row(
+            label,
+            Text(
+                f"{len(self.rulings)} of {len(self.cases)} decided",
+                style=theme.S_MUTED,
+            )
+            if self.cases
+            else "",
+        )
+        return row
+
+    def _paint_title(self) -> Text:
+        count = len(self.cases)
+        title = (
+            "Nothing is on the table. Who is right?"
+            if not count
+            else f"{count} issue{'s are' if count != 1 else ' is'} still open. Who is right?"
+        )
+        return Text(title, style=theme.style("strong"))
+
+    def _paint_lede(self) -> Text:
+        # Never hardcode the stall: this screen also serves a run that ran out
+        # of rounds or money, where nobody was stalling at all.
+        head = (
+            f"Neither side moved for {self.stalled} rounds. "
+            if self.result.outcome is Outcome.DEADLOCK
+            else f"{self.result.reason.capitalize()}. "
+        )
+        return Text(f"{head}Decide each, then continue.", style=theme.S_MUTED)
+
+    def _paint_left(self) -> Text:
+        left = len(self.cases) - len(self.rulings)
+        if not left:
+            return Text("all decided", style=theme.S_MUTED)
+        return Text(f"{left} issue{'s' if left != 1 else ''} left", style=theme.S_MUTED)
+
+    def _paint_footnote(self) -> Text:
+        return Text(
+            "Your calls become the arbiter's ruling for the next round.",
+            style=theme.S_MUTED,
+        )
+
+    def _go_label(self) -> str:
+        return "↵  Continue"
+
+    # --- what it does -----------------------------------------------------
+
+    def action_cursor(self, delta: int) -> None:
+        if not self.cases:
+            return
+        self._cursor = (self._cursor + delta) % len(self.cases)
+        self._sync()
+        self.query_one(f"#issue-{self._cursor}", IssueRow).scroll_visible(animate=False)
+
+    def action_rule(self, side: str) -> None:
+        if not self.cases:
+            return
+        self.rulings[self.cases[self._cursor].issue.fingerprint] = side
+        # Move to the next one still undecided, so a run of decisions is a run
+        # of keystrokes; wrapping to an already-decided row would be a dead end.
+        for step in range(1, len(self.cases) + 1):
+            nxt = (self._cursor + step) % len(self.cases)
+            if self.cases[nxt].issue.fingerprint not in self.rulings:
+                self._cursor = nxt
+                break
+        self._sync()
+
+    def action_carry_on(self) -> None:
+        # Guarded on the count, not the button: enter must be inert while
+        # anything is undecided whether or not a button happens to exist.
+        if len(self.rulings) < len(self.cases):
+            return
+        self.dismiss(dict(self.rulings))
+
+    def action_give_up(self) -> None:
+        """Bail out, and hand the rest to the configured default."""
+
+        answer = dict(self.rulings)
+        for case in self.cases:
+            answer.setdefault(case.issue.fingerprint, self.default)
+        self.dismiss(answer)
+
+    def _sync(self) -> None:
+        for index, row in enumerate(self.query(IssueRow)):
+            row.ruling = self.rulings.get(row.case.issue.fingerprint, "")
+            row.at_cursor = index == self._cursor
+        button = self.query_one("#deadlock-go", Button)
+        button.disabled = len(self.rulings) < len(self.cases)
+        for cell_id in ("#deadlock-outcome", "#deadlock-left"):
+            self.query_one(cell_id, Cell).refresh()
+        self.call_after_refresh(self._fit)
+
+    def on_issue_row_ruled(self, event: IssueRow.Ruled) -> None:
+        event.stop()
+        self._cursor = list(self.query(IssueRow)).index(event.row)
+        self.action_rule(event.side)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id or self.default)
+        event.stop()
+        self.action_carry_on()
+
+
+def _read_the_argument(result: DebateResult) -> list[IssueCase]:
+    """Pair each open complaint with the answer the solver gave it.
+
+    Awkward on purpose, because the data is: within a round the solver moves
+    before the critic, so `rounds[-1].solver` answers the ids of
+    `rounds[-2].critic` — one round stale. The join is by `Issue.fingerprint`,
+    which the deadlock condition itself guarantees is stable across exactly
+    those two rounds, falling back to the id and then to nothing.
+
+    Everything here is defensive: this screen also serves a run that ran out of
+    rounds or money, where there may be one round, no rebuttal, and no answer
+    to show at all.
+    """
+
+    rounds = list(result.rounds)
+    solver = rounds[-1].solver if rounds else None
+    earlier = rounds[-2].critic if len(rounds) > 1 else None
+    by_fingerprint = {i.fingerprint: i for i in (earlier.issues if earlier else [])}
+
+    cases = []
+    for issue in result.open_issues:
+        reply = None
+        if solver is not None:
+            twin = by_fingerprint.get(issue.fingerprint)
+            reply = solver.reply_to(twin.id) if twin else None
+            reply = reply or solver.reply_to(issue.id)
+        cases.append(
+            IssueCase(
+                issue=issue,
+                critic_says=issue.fix or issue.claim,
+                solver_says=reply.detail if reply else "",
+            )
+        )
+    return cases
 
 
 class ConfirmQuitScreen(ModalScreen[bool]):
@@ -743,17 +929,25 @@ class DaiApp(FollowsTerminal, App):
                 f"! commit skipped — {note}", style="plain-warning"
             )
 
-    async def _on_deadlock(self, pending: DebateResult) -> str:
-        """Stop everything and let the user call it."""
+    async def _on_deadlock(self, pending: DebateResult) -> dict:
+        """Stop everything and let the user rule on it, issue by issue."""
 
         self.query_one(StatusBar).set_phase("waiting for you")
-        choice = await self.push_screen_wait(
-            DeadlockScreen(pending, self.debate.deadlock_policy)
-        )
+        ruling = await self.push_screen_wait(
+            DeadlockScreen(
+                pending,
+                self.debate.deadlock_policy,
+                stalled=self.debate.referee.no_progress_rounds,
+            )
+        ) or {}
+        upheld = sum(1 for side in ruling.values() if side == "critic")
         self.query_one(VerdictLog).note(
-            f"you chose: {choice} wins", style="strong"
+            f"you upheld {upheld} of {len(ruling)}"
+            if ruling
+            else "you left it to the default",
+            style="strong",
         )
-        return choice or self.debate.deadlock_policy
+        return ruling
 
     async def _settle_merge(self) -> None:
         """Decide what goes home, and move it. Only ever reached on agreement.

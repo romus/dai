@@ -98,6 +98,9 @@ def _debate(cwd: Path) -> Debate:
         critic=critic,
         budget=Budget(Limits(max_rounds=5, max_usd=5.0, max_wall_seconds=None)),
         referee=Referee(),
+        # The whole first act: they stall, you rule, and the run carries on to
+        # agreement — which is what makes the merge dialog reachable after.
+        deadlock_policy="ask",
         solver_writes=False,
     )
 

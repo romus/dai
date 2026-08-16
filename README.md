@@ -61,11 +61,12 @@ From this checkout instead: `make run-here DIR=~/projects/foo ARGS="'the task'"`
 the task stays one argument.
 
 `dai --demo` plays a canned argument through the real screen: the panes stream, the
-verdicts land, the keys all work, and it ends at the merge dialog for you to answer. The
-agents are invented and so are the repositories, so it needs neither `claude` nor `codex`
-installed, spends nothing, and **writes nothing at all** — no files, no commits, no
-transcript. It is the cheapest way to see what a run looks like, and the only way to see
-the merge dialog refuse a repository.
+verdicts land, and the keys all work. The two sides deadlock, you rule on each open
+issue, the run carries on from your calls and ends at the merge dialog for you to answer.
+The agents are invented and so are the repositories, so it needs neither `claude` nor
+`codex` installed, spends nothing, and **writes nothing at all** — no files, no commits,
+no transcript. It is the cheapest way to see what a run looks like, and the only way to
+see the two decisions that a real run has to earn.
 
 In a repository you care about, start with `--dry-run`: both agents go read-only and
 you get their proposals instead. `make smoke` runs a real argument in a throwaway
@@ -84,7 +85,12 @@ Solver on the left, critic on the right, verdicts along the bottom.
 | `i` | say something to the agents — it outranks both |
 | `a` | accept the work as it stands and stop |
 
-On a deadlock the run pauses and asks who prevails.
+On a deadlock the run pauses and asks — issue by issue, showing you the critic's
+complaint beside the solver's answer to it. What you uphold goes back to the solver as
+binding instructions and what you dismiss leaves the argument for good, so the run
+carries on from there and can still end in agreement. `←`/`→` rule the issue under the
+cursor, `↑`/`↓` move without ruling, `Enter` continues once every one is decided, and
+`Esc` hands whatever is left to the configured default.
 
 The task box and the `i` box take more than one line: `Enter` sends, `Shift+Enter`
 breaks the line — or `Ctrl+J` / `Alt+Enter` in terminals that don't speak the kitty
@@ -126,8 +132,8 @@ A repository the agents change is moved onto `dai/<run-id>`, rooted on whatever 
 would merge back into — `main`/`master` by default. Each round lands there as an
 ordinary commit, and at consensus that base branch is fast-forwarded onto the result,
 leaving you on your own branch with the work committed and `git status` clean. Only
-consensus merges: a deadlock, a run out of budget or one you killed leaves you on
-`dai/<run-id>` instead.
+consensus merges: a run out of budget or one you killed leaves you on `dai/<run-id>`
+instead — as does a deadlock you were not there to rule on.
 
 By default dai asks first. On agreement it shows you every repository that changed —
 what it would merge into, how many lines either way, and which files — and merges the

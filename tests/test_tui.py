@@ -11,8 +11,19 @@ import pytest
 from dai.budget import Budget, Limits
 from dai.consensus import Referee
 from dai.config import Merge, SnapshotConfig
-from dai.models import AgentEvent, Outcome, Role, Severity, Issue
-from dai.orchestrator import Debate, DebateResult
+from dai.models import (
+    Action,
+    AgentEvent,
+    CriticTurn,
+    Issue,
+    Outcome,
+    Reply,
+    Role,
+    Severity,
+    SolverTurn,
+    Verdict,
+)
+from dai.orchestrator import Debate, DebateResult, Round
 from dai.snapshot import MergeCandidate, Snapshotter, ignore_locally
 from dai.transcript import Transcript
 from rich.console import Console
@@ -421,15 +432,124 @@ async def test_kill_confirmed_after_the_run_finished_just_exits(tmp_path):
 # --- deadlock screen ------------------------------------------------------
 
 
-async def test_deadlock_screen_reports_the_choice(tmp_path):
+def stuck_result(app, *issues):
+    """A deadlock with no rounds behind it — the degraded shape."""
+
+    return DebateResult(
+        outcome=Outcome.DEADLOCK, reason="neither side moved", rounds=[],
+        spend=app.debate.budget.spend, open_issues=list(issues),
+    )
+
+
+ISSUE = Issue(id="i7", severity=Severity.BLOCKER, claim="table still empty",
+              evidence="matrix.md:4", fix="fill it from the README")
+
+
+async def test_the_deadlock_screen_answers_with_a_ruling_per_issue(tmp_path):
+    """One verdict for the run was the old contract; each issue gets its own."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    other = Issue(id="i8", severity=Severity.MINOR, claim="stray whitespace")
+    answers = []
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = DeadlockScreen(stuck_result(app, ISSUE, other), "critic")
+        app.push_screen(screen, answers.append)
+        await pilot.pause()
+
+        await pilot.press("left")     # critic wins the first
+        await pilot.press("right")    # solver wins the second
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert answers == [{ISSUE.fingerprint: "critic", other.fingerprint: "solver"}]
+
+
+async def test_continue_stays_shut_until_every_issue_is_decided(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    other = Issue(id="i8", severity=Severity.MINOR, claim="stray whitespace")
+
+    async with app.run_test() as pilot:
+        await settle(app)
+        screen = DeadlockScreen(stuck_result(app, ISSUE, other), "critic")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert screen.query_one("#deadlock-go", Button).disabled
+
+        await pilot.press("left")
+        await pilot.pause()
+
+        assert screen.query_one("#deadlock-go", Button).disabled, "one left, still shut"
+
+        await pilot.press("left")
+        await pilot.pause()
+
+        assert not screen.query_one("#deadlock-go", Button).disabled
+
+
+async def test_the_deadlock_screen_shows_both_sides_of_the_argument(tmp_path):
+    """The solver's rebuttal is the half you were never shown before."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    earlier = CriticTurn(verdict=Verdict.REQUEST_CHANGES, issues=[ISSUE])
+    rebuttal = SolverTurn(replies=[Reply(id="i7", action=Action.REJECTED,
+                                         detail="the table is generated; that row has no data")])
+    pending = DebateResult(
+        outcome=Outcome.DEADLOCK, reason="neither side moved",
+        rounds=[Round(number=1, critic=earlier),
+                Round(number=2, solver=rebuttal, critic=earlier)],
+        spend=app.debate.budget.spend, open_issues=[ISSUE],
+    )
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await settle(app)
+        screen = DeadlockScreen(pending, "critic")
+        app.push_screen(screen)
+        await pilot.pause()
+        shown = " ".join(drawn(w, 118) for w in screen.query(Cell))
+
+        assert "table still empty" in shown
+        assert "matrix.md:4" in shown
+        assert "that row has no data" in shown, "the solver's side went missing"
+        # Letterspaced, like every other label on these screens.
+        assert theme.spaced("CRITIC SAYS") in shown
+        assert theme.spaced("SOLVER SAYS") in shown
+
+
+async def test_the_solver_side_is_found_even_when_the_critic_renumbers(tmp_path):
+    """Ids are renumbered freely between rounds; the claim is what is stable."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    renamed = Issue(id="j9", severity=ISSUE.severity, claim=ISSUE.claim,
+                    evidence=ISSUE.evidence)
+    earlier = CriticTurn(verdict=Verdict.REQUEST_CHANGES, issues=[ISSUE])
+    rebuttal = SolverTurn(replies=[Reply(id="i7", action=Action.REJECTED,
+                                         detail="answered under the old number")])
+    pending = DebateResult(
+        outcome=Outcome.DEADLOCK, reason="stuck",
+        rounds=[Round(number=1, critic=earlier),
+                Round(number=2, solver=rebuttal, critic=earlier)],
+        spend=app.debate.budget.spend, open_issues=[renamed],
+    )
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await settle(app)
+        screen = DeadlockScreen(pending, "critic")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert screen.cases[0].solver_says == "answered under the old number"
+
+
+async def test_the_deadlock_screen_survives_having_nothing_behind_it(tmp_path):
+    """It also serves a run that ran out of money: one round, no rebuttal."""
+
     app, _ = make_app(tmp_path, [solved()], [approve()])
     pending = DebateResult(
-        outcome=Outcome.DEADLOCK,
-        reason="neither side moved",
-        rounds=[],
-        spend=app.debate.budget.spend,
-        open_issues=[Issue(id="i1", severity=Severity.MAJOR, claim="still wrong",
-                           evidence="m.md:1")],
+        outcome=Outcome.BUDGET, reason="the next round is unaffordable", rounds=[],
+        spend=app.debate.budget.spend, open_issues=[ISSUE],
     )
 
     async with app.run_test() as pilot:
@@ -437,32 +557,28 @@ async def test_deadlock_screen_reports_the_choice(tmp_path):
         screen = DeadlockScreen(pending, "critic")
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.click("#solver")
-        await pilot.pause()
+        shown = " ".join(drawn(w) for w in screen.query(Cell))
 
-        assert isinstance(screen, DeadlockScreen)
+        assert screen.cases[0].solver_says == ""
+        assert "neither side moved" not in shown, "nobody was stalling"
+        assert "unaffordable" in shown
 
 
-async def test_deadlock_screen_shows_the_open_issues(tmp_path):
+async def test_escaping_the_deadlock_screen_hands_the_rest_to_the_default(tmp_path):
     app, _ = make_app(tmp_path, [solved()], [approve()])
-    issue = Issue(id="i7", severity=Severity.BLOCKER, claim="table still empty",
-                  evidence="matrix.md:4")
-    pending = DebateResult(
-        outcome=Outcome.DEADLOCK, reason="stuck", rounds=[],
-        spend=app.debate.budget.spend, open_issues=[issue],
-    )
+    other = Issue(id="i8", severity=Severity.MINOR, claim="stray whitespace")
+    answers = []
 
     async with app.run_test() as pilot:
         await settle(app)
-        screen = DeadlockScreen(pending, "critic")
-        app.push_screen(screen)
+        screen = DeadlockScreen(stuck_result(app, ISSUE, other), "critic")
+        app.push_screen(screen, answers.append)
+        await pilot.pause()
+        await pilot.press("right")     # solver wins the first, then give up
+        await pilot.press("escape")
         await pilot.pause()
 
-        # Textual v6 exposes a Static's text as `.content`, not `.renderable`.
-        rendered = " ".join(str(w.content) for w in screen.query(Static))
-        assert "table still empty" in rendered
-        assert "matrix.md:4" in rendered
-        assert "i7" in rendered
+    assert answers == [{ISSUE.fingerprint: "solver", other.fingerprint: "critic"}]
 
 
 async def test_a_real_deadlock_pauses_for_the_user(tmp_path):
@@ -484,11 +600,14 @@ async def test_a_real_deadlock_pauses_for_the_user(tmp_path):
             await asyncio.sleep(0.05)
         assert isinstance(app.screen, DeadlockScreen), "the user was never asked"
 
-        await pilot.click("#solver")
+        await pilot.press("right")   # solver wins it
+        await pilot.press("enter")
         await settle(app)
 
-        assert app.result is not None
-        assert "solver's version stands" in app.result.reason
+    assert app.result is not None
+    # Dismissing the only complaint leaves nothing to argue about.
+    assert app.result.outcome is Outcome.CONSENSUS
+    assert "you dismissed every open issue" in app.result.reason
 
 
 # --- the merge screen -----------------------------------------------------
@@ -513,6 +632,10 @@ def agreed_run(tmp_path, merge=Merge.ASK, repos=("proj",)):
 async def reach_the_question(app, pilot):
     await wait_for(lambda: isinstance(app.screen, MergeScreen))
     assert isinstance(app.screen, MergeScreen), "the user was never asked"
+    # Being on the stack is not the same as having composed: under load the
+    # rows arrive a frame later, and a test that looks too early sees none.
+    await wait_for(lambda: bool(app.screen.query(RepoRow)))
+    await pilot.pause()
     return app.screen
 
 
@@ -1015,26 +1138,25 @@ async def test_the_deadlock_screen_is_redrawn_under_a_theme_change(tmp_path):
     """It waits on the user for as long as they take, so it can outlive a palette."""
 
     app, _ = make_app(tmp_path, [solved()], [approve()])
-    issue = Issue(id="i7", severity=Severity.BLOCKER, claim="table still empty",
-                  evidence="matrix.md:4")
-    pending = DebateResult(
-        outcome=Outcome.DEADLOCK, reason="stuck", rounds=[],
-        spend=app.debate.budget.spend, open_issues=[issue],
-    )
+    other = Issue(id="i8", severity=Severity.MINOR, claim="stray whitespace")
 
     async with app.run_test() as pilot:
         await settle(app)
-        screen = DeadlockScreen(pending, "critic")
+        screen = DeadlockScreen(stuck_result(app, ISSUE, other), "critic")
         app.push_screen(screen)
         await pilot.pause()
+        await pilot.press("left")     # a ruling that must survive the repaint
 
         app.post_message(AppearanceChanged("light"))
         await pilot.pause()
         await pilot.pause()
 
-        rendered = " ".join(str(w.content) for w in screen.query(Static))
+        rendered = " ".join(drawn(w) for w in screen.query(Cell))
+
         assert "table still empty" in rendered
-        assert app.focused is screen.query_one("#critic", Button)
+        # Recomposing would take the rulings with it, which is why `repaint`
+        # refreshes each widget instead.
+        assert screen.rulings == {ISSUE.fingerprint: "critic"}
 
 
 async def test_the_prompt_follows_the_terminal_too(tmp_path):

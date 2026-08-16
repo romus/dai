@@ -434,6 +434,37 @@ than silently skipping it.
 {lang}
 """
 
+ARBITRATED = """\
+The human running this session read the deadlock and ruled on it, issue by issue. \
+Their ruling overrides the critic's judgement and your own.
+
+UPHELD — apply these
+
+{upheld}
+
+Implement them now, without further rebuttal. Answer each by id with `FIXED` or \
+`PARTIAL` and an address: which file and which lines now carry the fix. `REJECTED` is \
+not available for these. Where you implement something you still believe is wrong, \
+implement it anyway and say so in `detail`: the person reading this run needs to see \
+which changes were ruled, not a change of mind you did not have. If one is genuinely \
+impossible to satisfy, say so explicitly rather than silently skipping it.
+
+DISMISSED — these are closed
+
+{dismissed}
+
+They were decided in your favour. Do not act on them, do not undo work you already \
+did for them, and do not raise them again. If the critic files them once more they \
+are struck before anyone reads them.
+
+The argument continues after this turn: the critic reviews what you do here. Report \
+this round's files in `files_changed` — a file missing from it is one the critic \
+finds the hard way.
+{rigor}
+{lang}
+"""
+
+
 # The referee catches an unaudited approval and then has nowhere to put the finding:
 # it used to become a note nobody reads plus a wasted write-access solver turn over
 # an empty issue list. This is the only prompt in the file addressed to an agent
@@ -487,6 +518,29 @@ def critique_next_prompt(
         previous=render_issues(previous) or "(none)",
         responses=render_responses(previous, solver) or "(no response)",
         rigor=rigor_rule(rigor, critic=True),
+        lang=language_rule(language),
+    )
+
+
+def arbitrated_prompt(
+    upheld: list[Issue],
+    dismissed: list[Issue],
+    *,
+    language: str = AUTO,
+    rigor: str = STANDARD,
+) -> str:
+    """The one turn where the solver answers a person rather than the critic.
+
+    Deliberately not a `final` round: the critic reviews what comes back and the
+    argument continues. The dismissed half has to be stated as loudly as the
+    upheld half — told only what to fix, a solver reads the silence as doubt and
+    re-litigates the very points that were settled in its favour.
+    """
+
+    return ARBITRATED.format(
+        upheld=render_issues(upheld) or "(none)",
+        dismissed=render_issues(dismissed) or "(none)",
+        rigor=rigor_rule(rigor, critic=False),
         lang=language_rule(language),
     )
 
