@@ -23,6 +23,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dai"]
+# Developer tools — previews of the TUI screens and a fake engine — never ship.
+# Patterns here are matched against the source path, and an editable install is
+# a bare sys.path entry that this cannot reach, so `dai.dev` is present when you
+# work from the checkout and absent from anything pipx installs. `make
+# check-wheel` is the test that says so.
+exclude = ["src/dai/dev"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

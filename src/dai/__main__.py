@@ -28,6 +28,11 @@ from dai.snapshot import (
 )
 from dai.transcript import Transcript, list_runs, new_run_id
 
+try:  # stripped from the wheel — present only in a dev install
+    from dai import dev
+except ImportError:  # pragma: no cover - released builds have no dev module
+    dev = None  # type: ignore[assignment]
+
 EXIT_OK = 0
 EXIT_DISAGREED = 1
 EXIT_ERROR = 2
@@ -95,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--show", metavar="RUN_ID", help="print a past run's report")
     parser.add_argument("--version", action="version", version=f"dai {__version__}")
+    # Last, and only when the module is there: a released build's --help is
+    # exactly what it was before any of this existed.
+    if dev is not None:
+        dev.add_arguments(parser)
     return parser
 
 
@@ -102,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cwd = (args.cwd or Path.cwd()).resolve()
 
+    if dev is not None and (code := dev.handle(args)) is not None:
+        return code
     if args.init:
         path, added = config_module.ensure_config(args.config)
         print(f"config: {path}")
