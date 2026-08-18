@@ -7,9 +7,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from test_clipboard import pretend
 from textual.app import App, ComposeResult
 
 from dai.config import from_dict
+from dai.tui.clipboard import Attachments
 from dai.tui.completion import (
     MAX_ENTRIES,
     CompletingInput,
@@ -241,21 +243,33 @@ class Harness(App[str]):
 
     CSS_PATH = Path(__file__).parent.parent / "src" / "dai" / "tui" / "styles.tcss"
 
-    def __init__(self, cwd: Path, debounce_ms: int = 0) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        debounce_ms: int = 0,
+        attachments: Attachments | None = None,
+    ) -> None:
         super().__init__()
         # The stylesheet's colours all come from the theme, so a host that
         # loads it has to register one first.
         apply_theme(self)
         self.cwd = cwd
         self.debounce_ms = debounce_ms
+        self.attachments = attachments
         self.submitted: list[str] = []
+        self.prompts: list[str] = []
         self.cancelled = 0
 
     def compose(self) -> ComposeResult:
-        yield CompletingInput(cwd=self.cwd, debounce_ms=self.debounce_ms)
+        yield CompletingInput(
+            cwd=self.cwd,
+            debounce_ms=self.debounce_ms,
+            attachments=self.attachments,
+        )
 
     def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
         self.submitted.append(event.value)
+        self.prompts.append(event.prompt)
 
     def on_completing_input_cancelled(self, event: CompletingInput.Cancelled) -> None:
         self.cancelled += 1
@@ -495,3 +509,119 @@ async def test_with_debounce_off_every_keystroke_filters(repo):
         # matters is that filtering happened and the best hit leads.
         assert widget._visible
         assert widget._visible[0].path == "README.md"
+
+
+# --- pasting --------------------------------------------------------------
+
+
+def box_for(repo: Path) -> Attachments:
+    return Attachments(repo, repo / ".dai" / "runs" / "run-1" / "images")
+
+
+async def test_pasting_a_screenshot_leaves_a_token_not_a_path(monkeypatch, repo):
+    pretend(monkeypatch, image=True)
+    box = box_for(repo)
+    app = Harness(repo, attachments=box)
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "[Img1] "
+        assert (box.images_dir / "img1.png").is_file()
+
+
+async def test_a_second_screenshot_gets_its_own_number(monkeypatch, repo):
+    pretend(monkeypatch, image=True)
+    app = Harness(repo, attachments=box_for(repo))
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "[Img1] [Img2] "
+
+
+async def test_the_path_appears_only_in_what_the_agents_receive(monkeypatch, repo):
+    pretend(monkeypatch, image=True)
+    app = Harness(repo, attachments=box_for(repo))
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+        await pilot.press("f", "i", "x")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.submitted == ["[Img1] fix"]
+        assert app.prompts == [".dai/runs/run-1/images/img1.png fix"]
+
+
+async def test_pasting_text_inserts_it_and_writes_nothing(monkeypatch, repo):
+    pretend(monkeypatch, image=False, text="the table in docs/matrix.md")
+    box = box_for(repo)
+    app = Harness(repo, attachments=box)
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "the table in docs/matrix.md"
+        assert not box.images_dir.exists()
+
+
+async def test_text_still_pastes_where_screenshots_are_switched_off(
+    monkeypatch, repo
+):
+    """No attachments — the demo, and any workspace we cannot write to."""
+
+    pretend(monkeypatch, image=True, text="still typed by hand")
+    app = Harness(repo, attachments=None)
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "still typed by hand"
+        assert not (repo / ".dai").exists()
+
+
+async def test_pasting_into_the_middle_lands_at_the_cursor(monkeypatch, repo):
+    pretend(monkeypatch, image=True)
+    app = Harness(repo, attachments=box_for(repo))
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("a", "b")
+        await pilot.press("left")
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "a[Img1] b"
+
+
+async def test_an_empty_clipboard_changes_nothing(monkeypatch, repo):
+    pretend(monkeypatch, image=False, text=None)
+    app = Harness(repo, attachments=box_for(repo))
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("h", "i")
+        await pilot.press("ctrl+v")
+        await settle(pilot)
+
+        assert widget.value == "hi"

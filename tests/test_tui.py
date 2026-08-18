@@ -297,6 +297,31 @@ async def test_injecting_forwards_the_message_to_the_debate(tmp_path):
         assert debate._injections == ["the Status column must stay untouched"]
 
 
+async def test_a_mid_run_screenshot_goes_into_this_run_s_own_directory(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test():
+        await settle(app)
+        box = app._attachments()
+
+    assert box is not None
+    assert box.images_dir == tmp_path / ".dai" / "runs" / "run1" / "images"
+
+
+async def test_a_workspace_with_no_transcript_has_nowhere_to_paste_a_screenshot(
+    tmp_path,
+):
+    """Which is the demo, and any workspace we cannot write to."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    app.transcript.enabled = False
+
+    async with app.run_test():
+        await settle(app)
+
+        assert app._attachments() is None
+
+
 async def test_an_empty_injection_is_ignored(tmp_path):
     app, debate = make_app(tmp_path, [solved()], [approve()])
 

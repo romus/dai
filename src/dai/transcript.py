@@ -30,6 +30,16 @@ def new_run_id(now: datetime | None = None) -> str:
     return f"{stamp}-{suffix}"
 
 
+def run_dir(root: Path, run_id: str) -> Path:
+    """Where one run keeps its own files.
+
+    Not only the transcript's business any more: a screenshot pasted into the
+    prompt lands here too, and it lands before `Transcript` exists.
+    """
+
+    return Path(root) / RUNS_DIR / run_id
+
+
 @dataclass
 class RunInfo:
     run_id: str
@@ -45,7 +55,7 @@ class Transcript:
     def __init__(self, root: Path, run_id: str, *, enabled: bool = True) -> None:
         self.run_id = run_id
         self.enabled = enabled
-        self.dir = Path(root) / RUNS_DIR / run_id
+        self.dir = run_dir(root, run_id)
         self._events = self.dir / "events.jsonl"
         if self.enabled:
             try:
@@ -143,6 +153,11 @@ def list_runs(root: Path, limit: int = 20) -> list[RunInfo]:
     runs = []
     for directory in sorted(base.iterdir(), reverse=True):
         if not directory.is_dir():
+            continue
+        if not (directory / "events.jsonl").is_file():
+            # A directory with no events is not a run: it is what is left when
+            # a screenshot was pasted into a prompt the user then backed out
+            # of, or when a run died before it said anything.
             continue
         info = RunInfo(run_id=directory.name, path=directory)
         for record in read_events(directory):

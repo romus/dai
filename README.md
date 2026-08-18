@@ -101,6 +101,11 @@ the top level; typing after it fuzzy-matches the whole tree (`@cmpltn` finds
 `src/dai/tui/completion.py`). `↑`/`↓` move, `Enter` or `Tab` picks, `Esc` closes. What
 lands in the text is a plain relative path — the `@` never reaches the agents.
 
+`Ctrl+V` takes what the system clipboard holds. A screenshot is saved into the run's
+own directory and shows up in the box as `[Img1]`, which becomes the path to that file
+in what the agents are sent — so you can copy a screenshot and say "fix the header in
+[Img1]". Text on the clipboard is simply inserted.
+
 `dai` asks the terminal what colour it is and wears the matching palette, following a
 mid-run theme change on terminals that report one. `--theme dark|light` pins one.
 

@@ -222,6 +222,12 @@ InjectScreen Label {
     color: $dai-muted;
 }
 
+/* auto, not 1: on a narrow terminal the row wraps rather than losing keys. */
+#inject-hints {
+    height: auto;
+    margin: 1 0 0 0;
+}
+
 DeadlockScreen {
     align: center middle;
 }

@@ -23,6 +23,7 @@ from dai.snapshot import MergeCandidate, Snapshotter, describe, merge_promise
 from dai.transcript import Transcript
 from dai.tui import theme
 from dai.tui.appearance import AppearanceChanged, driver_class
+from dai.tui.clipboard import Attachments
 from dai.tui.completion import DEFAULT_DEBOUNCE_MS, CompletingInput
 from dai.tui.theme import apply_theme, hint, spaced
 from dai.tui.widgets import (
@@ -87,10 +88,16 @@ class InjectScreen(ModalScreen[str]):
 
     BINDINGS = [Binding("escape", "dismiss_empty", "cancel")]
 
-    def __init__(self, cwd: Path, debounce_ms: int = DEFAULT_DEBOUNCE_MS) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        debounce_ms: int = DEFAULT_DEBOUNCE_MS,
+        attachments: Attachments | None = None,
+    ) -> None:
         super().__init__()
         self.cwd = cwd
         self.debounce_ms = debounce_ms
+        self.attachments = attachments
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -99,11 +106,21 @@ class InjectScreen(ModalScreen[str]):
                 cwd=self.cwd,
                 debounce_ms=self.debounce_ms,
                 placeholder="e.g. the Status column in @… must stay untouched",
+                attachments=self.attachments,
                 id="inject",
             )
+            yield Static(self._hints(), id="inject-hints")
+
+    def _hints(self) -> Text:
+        return hint(("enter", "to send"), ("esc", "to cancel"))
+
+    def repaint(self) -> None:
+        self.query_one("#inject-hints", Static).update(self._hints())
 
     def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
-        self.dismiss(event.value)
+        # `prompt`, not `value`: the agents get paths where the box shows
+        # `[Img1]`.
+        self.dismiss(event.prompt)
 
     def on_completing_input_cancelled(self, event: CompletingInput.Cancelled) -> None:
         self.dismiss("")
@@ -654,11 +671,15 @@ class TaskPrompt(FollowsTerminal, App[str]):
         cwd: Path,
         debounce_ms: int = DEFAULT_DEBOUNCE_MS,
         appearance: str = "dark",
+        images_dir: Path | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class())
         apply_theme(self, appearance)
         self.cwd = cwd
         self.debounce_ms = debounce_ms
+        self.attachments = (
+            None if images_dir is None else Attachments(cwd, images_dir)
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="prompt-card"):
@@ -667,6 +688,7 @@ class TaskPrompt(FollowsTerminal, App[str]):
                 cwd=self.cwd,
                 debounce_ms=self.debounce_ms,
                 placeholder="e.g. fill in the empty cells in docs/matrix.md",
+                attachments=self.attachments,
             )
             yield Static(self._hints(), id="prompt-hints")
 
@@ -677,12 +699,7 @@ class TaskPrompt(FollowsTerminal, App[str]):
         return title
 
     def _hints(self) -> Text:
-        return hint(
-            ("enter", "to start"),
-            ("shift+enter", "new line"),
-            ("@", "to pick a path"),
-            ("esc", "to cancel"),
-        )
+        return hint(("enter", "to start"), ("esc", "to cancel"))
 
     def on_mount(self) -> None:
         # Both apps share one stylesheet, and an App is not a CSS selector, so
@@ -694,7 +711,7 @@ class TaskPrompt(FollowsTerminal, App[str]):
         self.query_one("#prompt-hints", Static).update(self._hints())
 
     def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
-        self.exit(event.value.strip())
+        self.exit(event.prompt.strip())
 
     def on_completing_input_cancelled(self, event: CompletingInput.Cancelled) -> None:
         self.exit("")
@@ -707,10 +724,11 @@ def ask_for_task(
     cwd: Path,
     debounce_ms: int = DEFAULT_DEBOUNCE_MS,
     appearance: str = "dark",
+    images_dir: Path | None = None,
 ) -> str:
     """Prompt for a task interactively; empty means the user backed out."""
 
-    return TaskPrompt(cwd, debounce_ms, appearance).run() or ""
+    return TaskPrompt(cwd, debounce_ms, appearance, images_dir).run() or ""
 
 
 class DaiApp(FollowsTerminal, App):
@@ -1074,7 +1092,23 @@ class DaiApp(FollowsTerminal, App):
     def action_inject(self) -> None:
         if self.result is not None:
             return
-        self.push_screen(InjectScreen(self.cwd, self.debounce_ms), self._injected)
+        self.push_screen(
+            InjectScreen(self.cwd, self.debounce_ms, self._attachments()),
+            self._injected,
+        )
+
+    def _attachments(self) -> Attachments | None:
+        """Where a screenshot pasted mid-run would go, if anywhere.
+
+        Tied to the transcript because the transcript is what already knows
+        whether this workspace can be written to at all — and because the demo
+        runs on a disabled one, which is what keeps `dai --demo` writing not
+        one byte while still being the real screen.
+        """
+
+        if not self.transcript.enabled:
+            return None
+        return Attachments(self.cwd, self.transcript.dir / "images")
 
     def _injected(self, message: str | None) -> None:
         if not message:

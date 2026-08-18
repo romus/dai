@@ -336,3 +336,17 @@ def test_blank_language_falls_back_to_auto():
 
     assert "SAME language" in language_rule("")
     assert "SAME language" in language_rule("AUTO")
+
+
+def test_an_image_in_the_task_is_pointed_out_to_both_sides():
+    task = "match the header to .dai/runs/run-1/images/img1.png"
+
+    for prompt in (solve_prompt(task), critique_first_prompt(task, SolverTurn())):
+        assert "attachment the human added on purpose" in prompt
+
+
+def test_a_task_with_no_image_reads_exactly_as_it_did():
+    from dai.protocol import attachments_rule
+
+    assert attachments_rule("fill in the table in docs/matrix.md") == ""
+    assert "attachment" not in solve_prompt("rename config.py to settings.py")

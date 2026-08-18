@@ -10,7 +10,9 @@ a typing trigger, not part of the task, since codex has no `@`-syntax and both
 agents must receive identical text.
 
 The text itself is multi-line: a task worth two agents arguing over rarely fits
-on one line. `Enter` commits, `Shift+Enter` breaks the line.
+on one line. `Enter` commits, `Shift+Enter` breaks the line, and `Ctrl+V` takes
+whatever is on the system clipboard — a screenshot becomes an `[ImgN]` token,
+text is simply inserted (see `clipboard.py`).
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ from textual.message import Message
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+from dai.tui import clipboard
+from dai.tui.clipboard import Attachments
 from dai.tui.theme import spaced
 
 #: Beyond this the index stops being useful and starts being a liability.
@@ -274,6 +278,16 @@ class PromptArea(TextArea):
             owner.action_close()
             return
 
+        if event.key == "ctrl+v":
+            # `TextArea` binds this to its own `action_paste`, which pastes
+            # Textual's internal buffer — not the system clipboard, and never a
+            # picture. Intercepting here is what stops the two from racing.
+            event.stop()
+            event.prevent_default()
+            if not self.read_only:
+                await owner.paste()
+            return
+
         if owner.is_open and event.key in ("up", "down", "tab"):
             event.stop()
             event.prevent_default()
@@ -301,10 +315,16 @@ class CompletingInput(Vertical):
     ]
 
     class Submitted(Message):
-        """Posted when the user commits the text, not a completion."""
+        """Posted when the user commits the text, not a completion.
 
-        def __init__(self, value: str) -> None:
+        Two texts, because they are no longer the same one: `value` is what the
+        user typed and can still see, `prompt` is what the agents receive, with
+        every `[ImgN]` swapped for the file it stands for.
+        """
+
+        def __init__(self, value: str, prompt: str | None = None) -> None:
             self.value = value
+            self.prompt = value if prompt is None else prompt
             super().__init__()
 
     class Cancelled(Message):
@@ -317,6 +337,7 @@ class CompletingInput(Vertical):
         placeholder: str = "",
         debounce_ms: int = DEFAULT_DEBOUNCE_MS,
         ignore: list[str] | None = None,
+        attachments: Attachments | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -324,6 +345,9 @@ class CompletingInput(Vertical):
         self.placeholder = placeholder
         self.debounce_ms = max(0, debounce_ms)
         self.ignore = ignore
+        #: Where a pasted picture goes. `None` disables that half of `ctrl+v`
+        #: — a read-only workspace, or the demo, which writes nothing at all.
+        self.attachments = attachments
         self._index: PathIndex | None = None
         self._visible: list[Entry] = []
 
@@ -365,8 +389,34 @@ class CompletingInput(Vertical):
         return self.input.value
 
     @property
+    def prompt(self) -> str:
+        """The text as the agents will read it: tokens resolved to paths."""
+
+        if self.attachments is None:
+            return self.value
+        return self.attachments.resolve(self.value)
+
+    @property
     def is_open(self) -> bool:
         return self._dropdown.display
+
+    # --- pasting ----------------------------------------------------------
+
+    async def paste(self) -> None:
+        """Take whatever the system clipboard holds, picture or text.
+
+        A picture first, because that is the reading a plain `ctrl+v` cannot
+        already give you: the terminal will hand over text by itself and never
+        an image. What lands in the box is the token, not the path — the path
+        is nobody's idea of readable, and `prompt` puts it back at send time.
+        """
+
+        if self.attachments is not None and (token := await self.attachments.grab()):
+            self.input.insert(f"{token} ")
+            return
+
+        if text := await clipboard.read_text():
+            self.input.insert(text)
 
     # --- reacting to typing ----------------------------------------------
 
@@ -428,7 +478,7 @@ class CompletingInput(Vertical):
         if self.is_open and self._visible:
             self.action_accept()
             return
-        self.post_message(self.Submitted(self.value))
+        self.post_message(self.Submitted(self.value, self.prompt))
 
     def action_accept(self) -> None:
         if not self.is_open or not self._visible:
