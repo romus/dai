@@ -138,9 +138,14 @@ Screen.task-prompt {
     align: center middle;
 }
 
+/* Capped at the width of what is actually drawn — the placeholder is the
+   longest line, and it needs 46 columns after the bar and its padding. The
+   card has no border and no background, so the eye centres the *ink*: a
+   96-column box holding a 49-column block reads as shoved to the left on any
+   wide terminal. The percentage keeps it shrinking with a narrow one. */
 #prompt-card {
     width: 88%;
-    max-width: 96;
+    max-width: 53;
     height: auto;
 }
 

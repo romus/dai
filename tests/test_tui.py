@@ -1046,6 +1046,31 @@ async def test_task_prompt_can_be_cancelled(tmp_path):
     assert app.return_value == ""
 
 
+async def test_the_prompt_sits_in_the_middle_of_a_wide_terminal(tmp_path):
+    """The card has no border and no background, so what is centred is the ink.
+
+    A box wider than its longest line is centred on something nobody can see:
+    a 96-column card around a 49-column block read as shoved to the left on
+    any terminal wide enough to show the difference.
+    """
+
+    from dai.tui.app import TaskPrompt
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        drawn = [
+            line
+            for strip in app.screen._compositor.render_strips()
+            if (line := strip.text.rstrip()).strip()
+        ]
+
+    left = min(len(line) - len(line.lstrip()) for line in drawn)
+    right = max(len(line) for line in drawn)
+
+    assert abs((left + right) / 2 - 100) <= 1, f"block spans {left}..{right} of 200"
+
+
 # --- following the terminal -----------------------------------------------
 
 
