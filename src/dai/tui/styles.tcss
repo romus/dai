@@ -138,32 +138,61 @@ Screen.task-prompt {
     align: center middle;
 }
 
-/* Capped at the width of what is actually drawn — the placeholder is the
-   longest line, and it needs 46 columns after the bar and its padding. The
-   card has no border and no background, so the eye centres the *ink*: a
-   96-column box holding a 49-column block reads as shoved to the left on any
-   wide terminal. The percentage keeps it shrinking with a narrow one. */
+/* Capped at a line worth reading rather than at the longest thing drawn: a task
+   two agents will argue over rarely fits in 46 columns, and wrapping it that
+   early was the whole complaint. The percentage keeps it shrinking on a narrow
+   terminal.
+
+   The card has no border and no background, so what the eye centres is the
+   *ink*, not the box — and a wide box is only honestly centred while something
+   holds its right edge. That something is `#prompt-chars`, down on the last
+   line; the two are one change, and removing the count would leave a short
+   prompt reading as shoved to the left. The gutter is the card's own padding
+   rather than a margin on each child, so the ink is symmetric by construction:
+   `card + 2` on the left, `card + width - 2` on the right. */
 #prompt-card {
     width: 88%;
-    max-width: 53;
+    max-width: 96;
     height: auto;
+    padding: 0 2;
 }
 
-#prompt-card > CompletingInput {
-    margin: 0 0 0 2;
-}
-
-/* The title's bullet, the input's bar and the hints all hang off the same two
-   columns; the text of each sits three further in. */
+/* The title's bullet, the input's bar and the hints all hang off column 0 of
+   the card's content; the text of each sits three further in. */
 #prompt-title {
     height: 1;
-    margin: 0 0 1 2;
+    margin: 0 0 1 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
-/* auto, not 1: on a narrow terminal the row wraps rather than losing keys. */
-#prompt-hints {
+/* auto, not 1: on a narrow terminal the keys wrap rather than being lost.
+   Stated either way, because a Horizontal is 1fr tall by default and would
+   stretch this auto-height card down the whole screen — the trap the rule
+   further down spells out. */
+#prompt-foot {
     height: auto;
-    margin: 1 0 0 5;
+    margin: 1 0 0 0;
+}
+
+#prompt-hints {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 0 3;
+}
+
+/* The margin is so the count never sits flush against `to cancel` at the width
+   where the two only just fit. */
+#prompt-chars {
+    width: auto;
+    height: 1;
+    margin: 0 0 0 2;
+    color: $dai-muted;
+}
+
+/* Too narrow for both: the keys keep the line, the count goes. */
+Screen.task-prompt.-narrow #prompt-chars {
+    display: none;
 }
 
 /* --- the @ picker ------------------------------------------------------ */

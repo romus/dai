@@ -330,6 +330,19 @@ class CompletingInput(Vertical):
     class Cancelled(Message):
         """Posted when escape is pressed with no dropdown left to close."""
 
+    class Changed(Message):
+        """Posted on every edit, because `TextArea.Changed` stops here.
+
+        The handler below has to stop it — the `@` picker is nobody else's
+        business — which leaves the screen above with no way to know that
+        anything was typed. `value` is what is in the box and on the screen,
+        not `prompt`: what is counted is what you can see.
+        """
+
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
     def __init__(
         self,
         *,
@@ -428,6 +441,7 @@ class CompletingInput(Vertical):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         event.stop()
+        self.post_message(self.Changed(self.input.value))
         mention = active_mention(self.input.value, self.input.cursor_position)
         if mention is None:
             self._close()

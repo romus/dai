@@ -258,6 +258,7 @@ class Harness(App[str]):
         self.attachments = attachments
         self.submitted: list[str] = []
         self.prompts: list[str] = []
+        self.changed: list[str] = []
         self.cancelled = 0
 
     def compose(self) -> ComposeResult:
@@ -270,6 +271,9 @@ class Harness(App[str]):
     def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
         self.submitted.append(event.value)
         self.prompts.append(event.prompt)
+
+    def on_completing_input_changed(self, event: CompletingInput.Changed) -> None:
+        self.changed.append(event.value)
 
     def on_completing_input_cancelled(self, event: CompletingInput.Cancelled) -> None:
         self.cancelled += 1
@@ -624,4 +628,23 @@ async def test_an_empty_clipboard_changes_nothing(monkeypatch, repo):
         await pilot.press("ctrl+v")
         await settle(pilot)
 
+        assert widget.value == "hi"
+
+
+async def test_every_edit_is_announced(repo):
+    """`TextArea.Changed` is stopped here, so the widget reposts its own.
+
+    Nothing above would otherwise know the text had grown — which the task
+    prompt's character count depends on.
+    """
+
+    app = Harness(repo)
+    async with app.run_test() as pilot:
+        widget = app.query_one(CompletingInput)
+        await ready(widget)
+
+        await pilot.press("h", "i")
+        await settle(pilot)
+
+        assert app.changed == ["h", "hi"]
         assert widget.value == "hi"

@@ -665,6 +665,13 @@ class TaskPrompt(FollowsTerminal, App[str]):
     # nothing to offer here but a theme switcher, and dai picks its own.
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [Binding("escape", "cancel", "cancel")]
+    #: Where the hints and the count stop fitting on one line together. Set on
+    #: the app rather than a screen because this one never leaves its default
+    #: screen, and Textual falls back to the app when the screen is silent.
+    #: `-wide` is never selected on; it is only "not narrow". 63 is measured,
+    #: not guessed: 3 columns of indent, 36 of keys, 2 of gap and 10 for the
+    #: count at four digits is a 51-column card, which 88% of 63 just makes.
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (63, "-wide")]
 
     def __init__(
         self,
@@ -690,13 +697,33 @@ class TaskPrompt(FollowsTerminal, App[str]):
                 placeholder="e.g. fill in the empty cells in docs/matrix.md",
                 attachments=self.attachments,
             )
-            yield Static(self._hints(), id="prompt-hints")
+            # Two Statics rather than one grid, though the grid is the idiom
+            # elsewhere: a narrow terminal has to drop the count, and half a
+            # grid cannot be hidden.
+            with Horizontal(id="prompt-foot"):
+                yield Static(self._hints(), id="prompt-hints")
+                yield Static(self._chars(0), id="prompt-chars")
 
     def _title(self) -> Text:
         title = Text()
         title.append("●  ", style=theme.SOLVER)
         title.append("What should the agents do?", style=theme.style("strong"))
         return title
+
+    def _chars(self, count: int) -> str:
+        """How much has been typed — and, at rest, the block's right edge.
+
+        Not `spaced()`, though it is small caps and everything else in that
+        register is: letterspacing is how a terminal says *large*, since it
+        cannot say *small*, and this line is meant to sit under the notice.
+        Muted and tight is the closest a fixed cell gets to a smaller type.
+
+        A plain string, not a styled `Text`: the colour is CSS, so it follows
+        the theme without `repaint` having to redraw it. It is never blank,
+        because an empty box is exactly when the edge most needs holding.
+        """
+
+        return f"{count} CHAR{'' if count == 1 else 'S'}"
 
     def _hints(self) -> Text:
         return hint(("enter", "to start"), ("esc", "to cancel"))
@@ -709,6 +736,9 @@ class TaskPrompt(FollowsTerminal, App[str]):
     def repaint(self) -> None:
         self.query_one("#prompt-title", Static).update(self._title())
         self.query_one("#prompt-hints", Static).update(self._hints())
+
+    def on_completing_input_changed(self, event: CompletingInput.Changed) -> None:
+        self.query_one("#prompt-chars", Static).update(self._chars(len(event.value)))
 
     def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
         self.exit(event.prompt.strip())
