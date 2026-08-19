@@ -8,9 +8,9 @@ that names nothing it examined is sent back rather than accepted. The solver ans
 fixing what it accepts, refusing what it doesn't, with reasons — until they agree or the
 rounds or budget run out.
 
-![The task box with the @ picker open, offering index.html, and the key hints underneath](docs/screenshot-task.png)
+![The task box with the @ picker open, offering index.html, and the key hints and character count underneath](docs/screenshot-task.png)
 
-![The dai TUI mid-round: solver on the left streaming its tool calls, critic on the right waiting, round and budget in the header](docs/screenshot-debate.png)
+![The dai TUI at the top of round 1: solver on the left, critic on the right waiting for it, round and budget in the header, the task and the run's branch along the bottom](docs/screenshot-debate.png)
 
 ## Requirements
 
@@ -100,6 +100,11 @@ In both boxes `@` opens a file picker scoped to the agents' directory. A bare `@
 the top level; typing after it fuzzy-matches the whole tree (`@cmpltn` finds
 `src/dai/tui/completion.py`). `↑`/`↓` move, `Enter` or `Tab` picks, `Esc` closes. What
 lands in the text is a plain relative path — the `@` never reaches the agents.
+
+`Ctrl+V` takes what the system clipboard holds. A screenshot is saved into the run's
+own directory and shows up in the box as `[Img1]`, which becomes the path to that file
+in what the agents are sent — so you can copy a screenshot and say "fix the header in
+[Img1]". Text on the clipboard is simply inserted.
 
 `dai` asks the terminal what colour it is and wears the matching palette, following a
 mid-run theme change on terminals that report one. `--theme dark|light` pins one.

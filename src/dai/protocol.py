@@ -14,6 +14,8 @@ FIXED what it never changed.
 
 from __future__ import annotations
 
+import re
+
 from dai.models import (
     Action,
     CriticTurn,
@@ -150,6 +152,36 @@ def language_rule(language: str = AUTO) -> str:
     )
 
 
+# A path in the task used to be a path and nothing else. Since `ctrl+v` puts
+# screenshots in there, one of them can be a picture the human pasted — and a
+# picture nobody opens is worse than no picture, because both sides then argue
+# about a task neither of them has fully read.
+_IMAGE_SUFFIXES = ("png", "jpg", "jpeg", "gif", "webp", "bmp")
+
+_IMAGE_PATH = re.compile(
+    r"[\w./\\~-]+\.(?:" + "|".join(_IMAGE_SUFFIXES) + r")\b", re.IGNORECASE
+)
+
+_ATTACHMENT = (
+    "The task points at an image file. That is an attachment the human added on "
+    "purpose, not decoration — open it and look at it before you decide what the "
+    "task asks for, and treat what it shows as part of the brief."
+)
+
+
+def attachments_rule(task: str) -> str:
+    """Tell the agent to open the picture the task points at, if it does.
+
+    Conditional on the task text rather than plumbed through from the frontend:
+    a hand-typed path to a mockup deserves the same line as a pasted one, and
+    the two prompt builders that see the task already have everything needed to
+    decide. Returns the empty string for the overwhelmingly common case, which
+    is what keeps a task with no images reading exactly as it did before.
+    """
+
+    return f"\n{_ATTACHMENT}\n" if _IMAGE_PATH.search(task) else ""
+
+
 # How hard the two lean on each other. The evidence rules do not move with it — an
 # approval always has to name what it examined, at every level — because the level
 # below `standard` would otherwise be the rubber stamp we are here to remove. What
@@ -245,7 +277,7 @@ time.
 
 TASK
 {task}
-
+{attachments}
 Your working directory is the repository you are in. Actually make the changes — \
 edit the files, run what you need to run. Do not merely describe what should be done.
 
@@ -281,7 +313,7 @@ found otherwise.
 
 TASK GIVEN TO THE SOLVER
 {task}
-
+{attachments}
 WHAT THE SOLVER REPORTS
 {report}
 
@@ -486,6 +518,7 @@ verdict object only.
 def solve_prompt(task: str, *, language: str = AUTO, rigor: str = STANDARD) -> str:
     return SOLVE.format(
         task=task.strip(),
+        attachments=attachments_rule(task),
         rigor=rigor_rule(rigor, critic=False),
         lang=language_rule(language),
     )
@@ -496,6 +529,7 @@ def critique_first_prompt(
 ) -> str:
     return CRITIQUE_FIRST.format(
         task=task.strip(),
+        attachments=attachments_rule(task),
         report=render_solver_report(solver),
         rigor=rigor_rule(rigor, critic=True),
         lang=language_rule(language),

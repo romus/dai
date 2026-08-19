@@ -288,6 +288,16 @@ def test_an_unfinished_run_still_lists(tmp_path):
     assert runs[0].outcome == ""
 
 
+def test_a_prompt_backed_out_of_is_not_a_run(tmp_path):
+    """A screenshot pasted and then abandoned leaves the directory, not a run."""
+
+    images = tmp_path / ".dai" / "runs" / "20260101-000000-aaaa" / "images"
+    images.mkdir(parents=True)
+    (images / "img1.png").write_bytes(b"x")
+
+    assert list_runs(tmp_path) == []
+
+
 # --- snapshot switches ----------------------------------------------------
 
 

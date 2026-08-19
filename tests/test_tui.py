@@ -297,6 +297,31 @@ async def test_injecting_forwards_the_message_to_the_debate(tmp_path):
         assert debate._injections == ["the Status column must stay untouched"]
 
 
+async def test_a_mid_run_screenshot_goes_into_this_run_s_own_directory(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test():
+        await settle(app)
+        box = app._attachments()
+
+    assert box is not None
+    assert box.images_dir == tmp_path / ".dai" / "runs" / "run1" / "images"
+
+
+async def test_a_workspace_with_no_transcript_has_nowhere_to_paste_a_screenshot(
+    tmp_path,
+):
+    """Which is the demo, and any workspace we cannot write to."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    app.transcript.enabled = False
+
+    async with app.run_test():
+        await settle(app)
+
+        assert app._attachments() is None
+
+
 async def test_an_empty_injection_is_ignored(tmp_path):
     app, debate = make_app(tmp_path, [solved()], [approve()])
 
@@ -1019,6 +1044,129 @@ async def test_task_prompt_can_be_cancelled(tmp_path):
         await pilot.pause()
 
     assert app.return_value == ""
+
+
+def _ink(app) -> tuple[int, int]:
+    """The columns the drawn characters actually span."""
+
+    drawn = [
+        line
+        for strip in app.screen._compositor.render_strips()
+        if (line := strip.text.rstrip()).strip()
+    ]
+    return (
+        min(len(line) - len(line.lstrip()) for line in drawn),
+        max(len(line) for line in drawn),
+    )
+
+
+async def test_the_prompt_sits_in_the_middle_of_a_wide_terminal(tmp_path):
+    """The card has no border and no background, so what is centred is the ink.
+
+    Which is why the count is not decoration. A box wider than its longest line
+    is centred on something nobody can see, and with an empty prompt the widest
+    thing drawn would be a 46-column placeholder inside a 96-column card — the
+    block reads as shoved left on any terminal wide enough to show it. The count
+    holds the right edge from the last line, and the card's padding holds the
+    left, so the two gutters are equal by construction rather than arithmetic.
+    """
+
+    from dai.tui.app import TaskPrompt
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        left, right = _ink(app)
+
+    assert abs((left + right) / 2 - 100) <= 1, f"block spans {left}..{right} of 200"
+    # And it is wide: this is the whole point of the redesign. The old cap made
+    # a task wrap at 46 columns on a terminal with 200 of them.
+    assert right - left >= 90, f"block is only {right - left} columns wide"
+
+
+async def test_the_prompt_counts_what_has_been_typed(tmp_path):
+    """The count is of what is in the box, and it is never blank."""
+
+    from dai.tui.app import TaskPrompt
+    from dai.tui.completion import CompletingInput
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(200, 30)) as pilot:
+        counter = app.query_one("#prompt-chars", Static)
+        assert counter.content == "0 CHARS"
+
+        app.query_one(CompletingInput).input.value = "x"
+        await pilot.pause()
+        assert counter.content == "1 CHAR"
+
+        app.query_one(CompletingInput).input.value = "fill in the table"
+        await pilot.pause()
+        assert counter.content == "17 CHARS"
+
+
+def _line_with(app, needle: str) -> str:
+    """The one drawn line containing `needle`."""
+
+    return next(
+        line
+        for strip in app.screen._compositor.render_strips()
+        if needle in (line := strip.text.rstrip())
+    )
+
+
+async def test_the_count_shares_the_line_with_the_keys(tmp_path):
+    """It sits at the far end of the last line, not beside the question."""
+
+    from dai.tui.app import TaskPrompt
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        assert _line_with(app, "to start").endswith("0 CHARS")
+        assert "CHARS" not in _line_with(app, "What should")
+
+
+async def test_a_narrow_terminal_drops_the_count_not_the_keys(tmp_path):
+    """Both on one line need columns a 60-wide terminal has not got.
+
+    What gives is the count, not the keys: a key row that wrapped would still
+    be readable, but it would push the block taller to say nothing new.
+    """
+
+    from dai.tui.app import TaskPrompt
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.pause()
+        assert app.query_one("#prompt-chars", Static).display is False
+        assert app.query_one("#prompt-hints", Static).display is True
+        assert app.query_one("#prompt-hints", Static).size.height == 1
+
+        await pilot.resize_terminal(120, 20)
+        await pilot.pause()
+        assert app.query_one("#prompt-chars", Static).display is True
+
+
+async def test_the_keys_keep_their_line_wherever_the_count_shows(tmp_path):
+    """The breakpoint is measured against the widest count, not a typical one.
+
+    A prompt long enough to need four digits is the case that decides it, and
+    getting it wrong costs the key row its last word to a second line. 63 is
+    the width where the two only just fit together.
+    """
+
+    from dai.tui.app import TaskPrompt
+    from dai.tui.completion import CompletingInput
+
+    app = TaskPrompt(tmp_path)
+    async with app.run_test(size=(63, 24)) as pilot:
+        app.query_one(CompletingInput).input.value = "x" * 9999
+        await pilot.pause()
+        await pilot.pause()
+
+        assert app.query_one("#prompt-chars", Static).display is True
+        assert app.query_one("#prompt-hints", Static).size.height == 1
+        assert _line_with(app, "to start").endswith("9999 CHARS")
 
 
 # --- following the terminal -----------------------------------------------

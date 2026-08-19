@@ -26,7 +26,7 @@ from dai.snapshot import (
     merge_promise,
     toplevel,
 )
-from dai.transcript import Transcript, list_runs, new_run_id
+from dai.transcript import Transcript, list_runs, new_run_id, run_dir
 
 EXIT_OK = 0
 EXIT_DISAGREED = 1
@@ -141,12 +141,20 @@ def main(argv: list[str] | None = None) -> int:
     # terminal by itself.
     appearance = _appearance(cfg.theme) if interactive else "dark"
 
+    # Minted here rather than after the prompt: a screenshot pasted into the
+    # task goes into this run's own directory, which makes it the earliest
+    # thing dai writes anywhere. The call itself creates nothing.
+    run_id = new_run_id()
+
     task = _resolve_task(args)
     if not task and interactive:
         from dai.tui import ask_for_task
 
         task = ask_for_task(
-            cwd, debounce_ms=cfg.completion_debounce_ms, appearance=appearance
+            cwd,
+            debounce_ms=cfg.completion_debounce_ms,
+            appearance=appearance,
+            images_dir=run_dir(cwd, run_id) / "images",
         )
     if not task:
         print('dai: give me a task, e.g. dai "fill in the table in docs/matrix.md"',
@@ -167,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         print("dai: `dai --demo` shows you a run without them", file=sys.stderr)
         return EXIT_ERROR
 
-    run_id = new_run_id()
     # Hide our own bookkeeping before anything writes it, so the first snapshot
     # does not sweep it up and `git status` stays about the user's work.
     if (repo := toplevel(cwd)) is not None:
