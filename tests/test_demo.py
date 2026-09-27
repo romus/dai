@@ -70,10 +70,10 @@ async def settled(app, tries: int = 120) -> None:
 # --- the promise -----------------------------------------------------------
 
 
-async def test_the_demo_writes_absolutely_nothing(tmp_path):
+async def test_the_demo_writes_absolutely_nothing(tmp_path, dai_home):
     """The whole reason it is safe to point a stranger at.
 
-    Not "no agents ran" — nothing at all: no files, no `.dai/`, no repository.
+    Not "no agents ran" — nothing at all: no files, no `~/.dai`, no repository.
     A sandbox quietly reintroduced anywhere would fail here.
     """
 
@@ -86,6 +86,7 @@ async def test_the_demo_writes_absolutely_nothing(tmp_path):
         await settled(app)
 
     assert list(tmp_path.iterdir()) == [], "the demo left something behind"
+    assert not dai_home.exists(), "the demo wrote into ~/.dai"
 
 
 async def test_the_fake_engine_writes_nothing_even_when_told_it_may(tmp_path):

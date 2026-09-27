@@ -15,7 +15,7 @@ import signal
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,11 +65,16 @@ class Engine(ABC):
         model: str = "",
         extra_args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        read_dirs: Sequence[Path] = (),
     ) -> None:
         self.cmd = cmd or self.name
         self.model = model
         self.extra_args = list(extra_args or [])
         self.env = env
+        #: Directories outside the workdir the agent may read — the run's
+        #: pasted screenshots, which live under `~/.dai`. An engine whose
+        #: sandbox already reads anywhere is free to ignore it.
+        self.read_dirs = [Path(d) for d in read_dirs]
 
     # --- subclass contract -------------------------------------------------
 

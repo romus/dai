@@ -312,3 +312,93 @@ def test_the_shipped_config_documents_the_theme_setting(tmp_path):
     cfg = load(ensure_config(tmp_path / "config.toml")[0])
 
     assert cfg.theme == "auto"
+
+
+# --- where the config lives -----------------------------------------------
+
+
+def test_the_config_lives_in_the_dai_home(dai_home):
+    from dai.config import config_path
+
+    assert config_path() == dai_home / "config.toml"
+
+
+def test_a_config_from_before_the_move_is_still_read(dai_home):
+    from dai.config import legacy_config_path
+
+    legacy = legacy_config_path()
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("[roles]\nsolver = 'codex'\n")
+
+    cfg = load()
+
+    assert cfg.solver == "codex"
+    assert cfg.source == legacy
+
+
+def test_the_new_config_wins_once_it_exists(dai_home):
+    from dai.config import config_path, legacy_config_path
+
+    legacy = legacy_config_path()
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("[roles]\nsolver = 'codex'\n")
+    config_path().parent.mkdir(parents=True)
+    config_path().write_text("[roles]\ncritic = 'claude'\n")
+
+    cfg = load()
+
+    assert (cfg.solver, cfg.critic) == ("claude", "claude")
+    assert cfg.source == config_path()
+
+
+def test_a_config_named_on_the_command_line_never_falls_back(tmp_path):
+    from dai.config import legacy_config_path
+
+    legacy = legacy_config_path()
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("[roles]\nsolver = 'codex'\n")
+
+    cfg = load(tmp_path / "absent.toml")
+
+    assert cfg.solver == "claude"
+    assert cfg.source is None
+
+
+def test_migrating_copies_the_old_config_once_and_leaves_it_be(dai_home):
+    from dai.config import config_path, legacy_config_path, migrate_legacy
+
+    legacy = legacy_config_path()
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("[roles]\nsolver = 'codex'\n")
+
+    assert migrate_legacy() == legacy
+    assert config_path().read_text() == legacy.read_text()
+    assert legacy.exists(), "the old file is the user's to delete"
+
+    config_path().write_text("[roles]\nsolver = 'claude'\n")
+    assert migrate_legacy() is None, "an existing config is never overwritten"
+    assert "claude" in config_path().read_text()
+
+
+def test_there_is_nothing_to_migrate_without_an_old_config(dai_home):
+    from dai.config import migrate_legacy
+
+    assert migrate_legacy() is None
+    assert not dai_home.exists()
+
+
+def test_init_moves_the_old_config_home_and_tops_it_up(dai_home, capsys):
+    from dai.__main__ import main
+    from dai.config import config_path, legacy_config_path
+
+    legacy = legacy_config_path()
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("[roles]\nsolver = 'codex'\n")
+
+    assert main(["--init"]) == 0
+
+    out = capsys.readouterr().out
+    assert f"config: {config_path()}" in out
+    assert f"copied from {legacy}" in out
+    assert "solver = 'codex'" in config_path().read_text()
+    assert load().snapshot.merge is Merge.ASK  # topped up with what it lacked

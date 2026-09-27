@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 
+from dai import home
 from dai.budget import Limits, Pricing
 from dai.protocol import RIGOR, STANDARD
 
@@ -79,13 +80,35 @@ class Config:
         return self.engines.get(name) or EngineConfig()
 
 
-def config_dir() -> Path:
-    root = os.environ.get("XDG_CONFIG_HOME")
-    return (Path(root) if root else Path.home() / ".config") / APP
-
-
 def config_path() -> Path:
-    return config_dir() / "config.toml"
+    return home.root() / "config.toml"
+
+
+def legacy_config_path() -> Path:
+    """Where the config lived before everything moved under `~/.dai`.
+
+    Still read when the new one does not exist, so an upgrade does not quietly
+    forget somebody's settings; `dai --init` copies it across.
+    """
+
+    root = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(root) if root else Path.home() / ".config") / APP / "config.toml"
+
+
+def migrate_legacy() -> Path | None:
+    """Copy the old config into `~/.dai`, once. Returns where it came from.
+
+    A copy, not a move: the old file is the user's, and once the new one exists
+    it is simply never read again. Copied byte for byte even if it is broken —
+    `ensure_config` refuses to top up a file it cannot parse, and so should this.
+    """
+
+    target, legacy = config_path(), legacy_config_path()
+    if target.exists() or not legacy.is_file():
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(legacy.read_bytes())
+    return legacy
 
 
 DEFAULTS = Config(
@@ -328,9 +351,18 @@ def _end_of(lines: list[str], section: str) -> int | None:
 
 
 def load(path: Path | None = None) -> Config:
-    """Read config from disk, falling back to defaults for anything absent."""
+    """Read config from disk, falling back to defaults for anything absent.
 
-    target = path or config_path()
+    With no path given, `~/.dai/config.toml` wins, and the pre-`~/.dai` file is
+    read only while there is no new one. A path given explicitly is exactly
+    that file, and never falls back to anything.
+    """
+
+    target = path
+    if target is None:
+        target = config_path()
+        if not target.exists() and legacy_config_path().exists():
+            target = legacy_config_path()
     if not target.exists():
         return replace(DEFAULTS, source=None)
 

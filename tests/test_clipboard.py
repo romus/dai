@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from dai.protocol import attachments_rule
+from dai.transcript import run_dir
 from dai.tui import clipboard
 from dai.tui.clipboard import Attachments
 
@@ -24,7 +26,7 @@ def workspace(tmp_path):
 
 
 def attachments(workspace: Path, run_id: str = "20260818-120000-abcd") -> Attachments:
-    return Attachments(workspace, workspace / ".dai" / "runs" / run_id / "images")
+    return Attachments(workspace, run_dir(workspace, run_id) / "images")
 
 
 def pretend(monkeypatch, *, image: bool = False, text: str | None = None) -> None:
@@ -116,17 +118,31 @@ async def test_pasting_writes_the_picture_and_hands_back_a_token(
     assert written.is_file()
 
 
-async def test_the_token_resolves_to_a_path_relative_to_the_workspace(
-    monkeypatch, workspace
+async def test_the_token_resolves_to_the_absolute_path_under_the_dai_home(
+    monkeypatch, workspace, dai_home
 ):
     pretend(monkeypatch, image=True)
     box = attachments(workspace)
     await box.grab()
 
     resolved = box.resolve("look at [Img1] and fix the header")
-    assert resolved == (
-        "look at .dai/runs/20260818-120000-abcd/images/img1.png and fix the header"
-    )
+    picture = box.images_dir / "img1.png"
+    assert picture.is_relative_to(dai_home)
+    assert resolved == f"look at {picture} and fix the header"
+    # A path nobody tells the agents to open is worse than none.
+    assert attachments_rule(resolved) != ""
+
+
+async def test_a_run_directory_inside_the_workspace_is_named_relative_to_it(
+    monkeypatch, workspace
+):
+    """Only if somebody has put `DAI_HOME` in the project — but then relative."""
+
+    pretend(monkeypatch, image=True)
+    box = Attachments(workspace, workspace / "shots" / "images")
+    await box.grab()
+
+    assert box.resolve("[Img1]") == "shots/images/img1.png"
 
 
 async def test_a_token_nobody_minted_is_left_alone(monkeypatch, workspace):
@@ -135,7 +151,7 @@ async def test_a_token_nobody_minted_is_left_alone(monkeypatch, workspace):
     await box.grab()
 
     # `[Img7]` is the user's own typing, not one of ours.
-    assert box.resolve("[Img7] and [Img1]").startswith("[Img7] and .dai/")
+    assert box.resolve("[Img7] and [Img1]") == f"[Img7] and {box.images_dir / 'img1.png'}"
 
 
 async def test_numbering_counts_off_the_directory_not_off_the_widget(
@@ -156,16 +172,24 @@ async def test_numbering_counts_off_the_directory_not_off_the_widget(
     ]
 
 
-async def test_the_run_directory_is_hidden_from_git_before_anything_is_in_it(
+async def test_a_pasted_picture_leaves_the_user_s_repo_untouched(
     monkeypatch, workspace
 ):
+    """Nothing lands in the project, so there is nothing to hide from git."""
+
     git("init", "-q", "-b", "main", cwd=workspace)
+    exclude = workspace / ".git" / "info" / "exclude"
+    before = exclude.read_text() if exclude.exists() else ""
     pretend(monkeypatch, image=True)
 
     await attachments(workspace).grab()
 
-    exclude = (workspace / ".git" / "info" / "exclude").read_text()
-    assert ".dai/" in exclude
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True
+    ).stdout
+    assert status == ""
+    assert not (workspace / ".dai").exists()
+    assert (exclude.read_text() if exclude.exists() else "") == before
 
 
 async def test_a_clipboard_with_no_picture_creates_no_directory(

@@ -24,8 +24,8 @@ from dai.models import (
     Verdict,
 )
 from dai.orchestrator import Debate, DebateResult, Round
-from dai.snapshot import MergeCandidate, Snapshotter, ignore_locally
-from dai.transcript import Transcript
+from dai.snapshot import MergeCandidate, Snapshotter
+from dai.transcript import Transcript, run_dir
 from rich.console import Console
 from textual.app import App
 from textual.color import Color, ColorParseError
@@ -297,7 +297,7 @@ async def test_injecting_forwards_the_message_to_the_debate(tmp_path):
         assert debate._injections == ["the Status column must stay untouched"]
 
 
-async def test_a_mid_run_screenshot_goes_into_this_run_s_own_directory(tmp_path):
+async def test_a_mid_run_screenshot_goes_into_this_run_s_own_directory(tmp_path, dai_home):
     app, _ = make_app(tmp_path, [solved()], [approve()])
 
     async with app.run_test():
@@ -305,7 +305,8 @@ async def test_a_mid_run_screenshot_goes_into_this_run_s_own_directory(tmp_path)
         box = app._attachments()
 
     assert box is not None
-    assert box.images_dir == tmp_path / ".dai" / "runs" / "run1" / "images"
+    assert box.images_dir == run_dir(tmp_path, "run1") / "images"
+    assert box.images_dir.is_relative_to(dai_home), "screenshots live in ~/.dai"
 
 
 async def test_a_workspace_with_no_transcript_has_nowhere_to_paste_a_screenshot(
@@ -381,7 +382,8 @@ async def test_q_mid_run_asks_then_kills(tmp_path):
     assert app.result is not None
     assert app.result.outcome is Outcome.ABORTED
     assert "killed" in app.result.reason
-    assert (tmp_path / ".dai" / "runs" / "run1" / "report.md").is_file()
+    assert (run_dir(tmp_path, "run1") / "report.md").is_file()
+    assert not (tmp_path / ".dai").exists(), "nothing of dai's in the workdir"
 
 
 async def test_the_kill_switch_never_merges_the_work(tmp_path):
@@ -393,7 +395,6 @@ async def test_the_kill_switch_never_merges_the_work(tmp_path):
     """
 
     repo = make_repo(tmp_path)
-    ignore_locally(repo, ".dai/")  # as the real entry point does, before anything writes
     snapshotter = Snapshotter(repo, "run1", SnapshotConfig(merge=Merge.ALWAYS))
     snapshotter.observe()  # the round-1 gate, before any agent moves
     (repo / "a.txt").write_text("the agents got this far\n")
@@ -643,7 +644,6 @@ def agreed_run(tmp_path, merge=Merge.ASK, repos=("proj",)):
 
     for name in repos:
         make_repo(tmp_path / name)
-    ignore_locally(tmp_path / repos[0], ".dai/")
     snapshotter = Snapshotter(tmp_path, "run1", SnapshotConfig(merge=merge))
     snapshotter.observe()  # the round-1 gate, before any agent moves
     for name in repos:
@@ -830,7 +830,7 @@ async def test_q_on_the_merge_screen_keeps_the_branches_rather_than_killing(tmp_
     assert app.result is not None
     assert app.result.outcome is Outcome.CONSENSUS  # not ABORTED
     assert snapshotter.summary()[0].merged is False
-    assert (tmp_path / ".dai" / "runs" / "run1" / "report.md").is_file()
+    assert (run_dir(tmp_path, "run1") / "report.md").is_file()
 
 
 def many_candidates(tmp_path, count):
