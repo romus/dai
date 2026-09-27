@@ -14,7 +14,13 @@ from dai.config import Config, Merge, SnapshotConfig
 from dai.consensus import Referee
 from dai.engines import Engine, build_engine
 from dai.models import AgentEvent, Outcome, Role
-from dai.orchestrator import Debate, DebateEvent, DebateResult
+from dai.orchestrator import (
+    Debate,
+    DebateEvent,
+    DebateResult,
+    Objection,
+    ObjectionRecap,
+)
 from dai.protocol import RIGOR
 from dai.snapshot import (
     MergeCandidate,
@@ -594,10 +600,18 @@ async def _run_headless(
                 Role.CRITIQUE: "reviewing",
                 Role.REBUT: "answering",
             }.get(event.role, str(event.role))
+            which = (
+                "extra round"
+                if debate.is_extra(event.round)
+                else f"round {debate.counted_round(event.round)}"
+            )
             print(
-                f"{_colour('▸', BLUE)} round {event.round} · "
+                f"{_colour('▸', BLUE)} {which} · "
                 f"{_colour(event.engine, BOLD)} {label}"
             )
+        elif event.kind == "objection":
+            print()
+            print(f"{_colour('▸', YELLOW)} extra round · your note: {event.text}")
         elif event.kind == "note":
             print(f"  {_colour('!', YELLOW)} {event.text}")
         elif event.kind == "finished":
@@ -626,13 +640,27 @@ async def _run_headless(
 
     result = await debate.run()
 
-    if snapshotter.active:
-        final = await asyncio.to_thread(
-            snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
-        )
-        transcript.snapshots(final)
-        if result.agreed and snapshotter.settings.merge is not Merge.NEVER:
-            await _settle_merge(snapshotter, snapshotter.settings.merge, cwd)
+    # The same loop as the TUI's: an objection instead of a merge buys the
+    # agents one extra round, and the question comes back only if they agree.
+    while True:
+        if snapshotter.active:
+            final = await asyncio.to_thread(
+                snapshotter.capture_final, f"{result.outcome.value}: {result.reason}"
+            )
+            transcript.snapshots(final)
+        note = None
+        if (
+            snapshotter.active
+            and result.agreed
+            and snapshotter.settings.merge is not Merge.NEVER
+        ):
+            note = await _settle_merge(
+                snapshotter, snapshotter.settings.merge, cwd, debate
+            )
+        if not note:
+            break
+        snapshotter.mark()
+        result = await debate.overrule(note)
 
     report_path = transcript.finish(
         result,
@@ -647,44 +675,84 @@ async def _run_headless(
     return result
 
 
-async def _settle_merge(snapshotter: Snapshotter, merge: Merge, cwd: Path) -> None:
+async def _settle_merge(
+    snapshotter: Snapshotter, merge: Merge, cwd: Path, debate: Debate | None = None
+) -> str | None:
     """Decide what goes home, and move it. Only ever called on agreement.
 
     `always` is the old behaviour untouched. `ask` shows what each repository
     would write and takes an answer — but only if there is somebody to answer:
     piped or redirected, nothing is merged and the record says why, which is
     the same way `deadlock_policy = "ask"` degrades with nobody to ask.
+
+    Given the debate, the answer may also be an objection: then nothing is
+    merged, and the note comes back for the caller to send the agents.
     """
 
     if merge is Merge.ALWAYS:
         await asyncio.to_thread(snapshotter.merge)
-        return
+        return None
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         await asyncio.to_thread(
             snapshotter.merge, only=(), kept="no terminal to ask on"
         )
-        return
+        return None
 
     rows = await asyncio.to_thread(snapshotter.preview)
     if not rows:
-        return
-    chosen = await asyncio.to_thread(_ask_merge, rows)
+        return None
+
+    ask = {}
+    if debate is not None:
+        ask = {
+            "can_object": True,
+            "blocked": debate.objection_blocked() or "",
+            "recap": debate.objection_recap(),
+        }
+        # Nobody is spending anything while a person reads the diff.
+        debate.budget.hold()
+    try:
+        chosen = await asyncio.to_thread(lambda: _ask_merge(rows, **ask))
+    finally:
+        if debate is not None:
+            debate.budget.release()
+    if isinstance(chosen, Objection):
+        return chosen.note
     await asyncio.to_thread(
         snapshotter.merge, only=chosen, kept="you kept the branch"
     )
+    return None
 
 
-def _ask_merge(rows: list[MergeCandidate]) -> list[Path]:
+def _ask_merge(
+    rows: list[MergeCandidate],
+    *,
+    can_object: bool = False,
+    blocked: str = "",
+    recap: ObjectionRecap | None = None,
+) -> list[Path] | Objection:
     """Show what would be written, and ask. All of it or none of it.
 
     Deliberately not a picker: a selector built out of raw stdin is worse than
     an honest yes or no, and the one that can pick repository by repository is
     the TUI. Anything but yes keeps every branch, which is also what an
     unreadable stdin and an interrupt mean.
+
+    With `can_object`, `o` is a third answer: one line of note, and the agents
+    go back for an extra round instead. An empty note objects to nothing, so
+    the question is simply put again.
     """
 
     print()
+    if recap is not None:
+        verdict = {
+            "addressed": _colour("critic: addressed ✓", GREEN),
+            "open": _colour("critic: still open", YELLOW),
+            "dismissed": _colour("you dismissed it", DIM),
+        }.get(recap.status, "")
+        print(f"{_colour('extra round · your note', YELLOW)} — {verdict}")
+        print(f"    {_colour(recap.answer or recap.note, DIM)}")
     print(_colour(f"{_repos(len(rows))} changed:", BOLD))
     for row in rows:
         counts = " ".join(
@@ -703,21 +771,54 @@ def _ask_merge(rows: list[MergeCandidate]) -> list[Path]:
             else " · ".join(row.files[:4])
             + (f" +{len(row.files) - 4} more" if len(row.files) > 4 else "")
         )
-        print(f"    {_colour(detail, YELLOW if row.refusal else DIM)}")
+        if not row.refusal and row.since is not None and any(row.since):
+            plus, minus = row.since
+            bought = " ".join(
+                part for part in (f"+{plus}" if plus else "", f"-{minus}" if minus else "")
+                if part
+            )
+            detail = f"{_colour(f'{bought} from your round', YELLOW)} · " + _colour(
+                detail, DIM
+            )
+            print(f"    {detail}")
+        else:
+            print(f"    {_colour(detail, YELLOW if row.refusal else DIM)}")
 
     ready = [row.repo for row in rows if row.mergeable]
     if not ready:
         print(_colour("none of them can be merged — the branches stay", DIM))
         return []
 
-    try:
-        answer = input(
-            f"merge {_repos(len(ready))} into their base branches? [y/N] "
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        answer = ""
-    return ready if answer in ("y", "yes") else []
+    if can_object and blocked:
+        print(_colour(f"objecting is not available — {blocked}", DIM))
+        can_object = False
+    elif can_object:
+        print(
+            _colour(
+                "o objects instead: one extra round with a note of yours, "
+                "outside the round limit",
+                DIM,
+            )
+        )
+
+    choices = "[y/N/o]" if can_object else "[y/N]"
+    while True:
+        try:
+            answer = input(
+                f"merge {_repos(len(ready))} into their base branches? {choices} "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        if not (can_object and answer in ("o", "object")):
+            return ready if answer in ("y", "yes") else []
+        try:
+            note = input("what should they fix before merge? ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        if note:
+            return Objection(note)
 
 
 def _repos(number: int) -> str:

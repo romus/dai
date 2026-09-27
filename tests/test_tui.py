@@ -38,10 +38,19 @@ from dai.tui.app import (
     DeadlockScreen,
     InjectScreen,
     MergeScreen,
+    ObjectionScreen,
 )
 from dai.tui.appearance import AppearanceChanged
 from dai.tui.theme import apply_theme
-from dai.tui.widgets import AgentPane, Cell, RepoRow, StatusBar, VerdictLog
+from dai.tui.completion import CompletingInput
+from dai.tui.widgets import (
+    AgentPane,
+    Cell,
+    RepoRow,
+    RulingBanner,
+    StatusBar,
+    VerdictLog,
+)
 from test_orchestrator import Scripted, approve, changes, replies, solved
 
 
@@ -805,7 +814,7 @@ async def test_the_question_shows_what_would_be_written(tmp_path):
         await pilot.pause()
 
         shown = " ".join(drawn(w) for w in screen.query(RepoRow))
-        header = " ".join(str(w.render()) for w in screen.query(Cell))
+        header = " ".join(drawn(w) for w in screen.query(Cell))
 
         assert "index.html" in shown and "primes.html" in shown
         assert "+318" in shown and "-41" in shown
@@ -977,6 +986,294 @@ async def test_merging_without_asking_never_shows_the_screen(tmp_path):
 
     assert not any(seen), "told to merge, it asked anyway"
     assert snapshotter.summary()[0].merged is True
+
+
+# --- objecting instead of merging ----------------------------------------------
+
+NOTE = "the status column must show how many results search found"
+
+
+class Gated(Scripted):
+    """Plays its script, but holds one turn until the test lets it go.
+
+    `edit` runs as that turn starts: the extra round's work landing on disk.
+    """
+
+    def __init__(self, name, script, *, hold_at, edit=None):
+        super().__init__(name, script)
+        self.hold_at = hold_at
+        self.edit = edit
+        self.calls = 0
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, prompt, **kwargs):
+        self.calls += 1
+        if self.calls == self.hold_at:
+            if self.edit is not None:
+                self.edit()
+            self.held.set()
+            await self.release.wait()
+        return await super().run(prompt, **kwargs)
+
+
+def objecting_run(tmp_path, solver):
+    repo = make_repo(tmp_path / "proj")
+    snapshotter = Snapshotter(tmp_path, "run1", SnapshotConfig(merge=Merge.ASK))
+    snapshotter.observe()
+    (repo / "a.txt").write_text("the agents did this\n")
+    critic = Scripted("critic-engine", [approve(), approve()])
+    app, debate = make_app_from(tmp_path, solver, critic, snapshotter=snapshotter)
+    return app, debate, snapshotter, repo
+
+
+async def object_with(app, pilot, note: str = NOTE) -> ObjectionScreen:
+    await pilot.press("o")
+    await wait_for(lambda: isinstance(app.screen, ObjectionScreen))
+    screen = app.screen
+    assert isinstance(screen, ObjectionScreen), "o did not ask what to object to"
+    await wait_for(lambda: bool(screen.query(CompletingInput)))
+    if note:
+        screen.query_one(CompletingInput).input.insert(note)
+        await pilot.pause()
+    return screen
+
+
+def objection_screen(tmp_path):
+    return lambda: ObjectionScreen([], rounds_done=1, cwd=tmp_path)
+
+
+async def test_objecting_runs_an_extra_round_and_asks_again(tmp_path):
+    """8a → 8b → 9a → 8c: object, watch the extra round, get the question back."""
+
+    repo = tmp_path / "proj"
+    solver = Gated(
+        "solver-engine",
+        [solved(), solved(responses=[
+            {"id": "you", "action": "FIXED", "detail": "status now reads 3 results"}
+        ])],
+        hold_at=2,
+        edit=lambda: (repo / "a.txt").write_text("the agents did this\nand your note\n"),
+    )
+    app, debate, snapshotter, repo = objecting_run(tmp_path, solver)
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        merge = await reach_the_question(app, pilot)
+        assert merge.query_one("#merge-object", Button).display
+
+        await object_with(app, pilot)
+        # Same dialog, changing its mind: the merge card is not left underneath.
+        assert not merge.query_one("#merge-card").display
+        await pilot.press("enter")
+        await asyncio.wait_for(solver.held.wait(), timeout=5)
+        await pilot.pause()
+
+        # The extra round, on the main screen.
+        banner = app.query_one(RulingBanner)
+        status = app.query_one(StatusBar)
+        assert banner.display and banner.note == NOTE
+        assert (status.round, status.extra, status.phase) == (1, 1, "extra round")
+        assert app.result is None, "the run has to be live again for p, i and q"
+
+        solver.release.set()
+        await wait_for(
+            lambda: isinstance(app.screen, MergeScreen) and app.screen is not merge
+        )
+        again = app.screen
+        assert isinstance(again, MergeScreen) and again is not merge
+        await wait_for(lambda: bool(again.query(RepoRow)))
+        await pilot.pause()
+
+        assert not banner.display
+        assert again.recap is not None and again.recap.status == "addressed"
+        assert "status now reads 3 results" in drawn(again.query_one("#merge-recap"))
+        assert "Object again" in str(again.query_one("#merge-object", Button).label)
+        row = again.query_one(RepoRow)
+        assert row.candidate.since == (1, 0)
+        assert "+1 from your round" in drawn(row)
+
+        await pilot.press("enter")
+        await wait_for(lambda: app._settled)
+
+    assert snapshotter.summary()[0].merged is True
+    assert (repo / "a.txt").read_text().endswith("and your note\n")
+    assert debate.rounds[-1].objection == NOTE
+    report = (run_dir(tmp_path, "run1") / "report.md").read_text()
+    assert "extra round, after your objection" in report and NOTE in report
+
+
+async def test_escaping_the_objection_returns_to_the_same_question(tmp_path):
+    app, snapshotter = agreed_run(tmp_path, repos=("one", "two"))
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        merge = await reach_the_question(app, pilot)
+        await pilot.press("space")  # a choice already made must survive the detour
+        await object_with(app, pilot, note="")
+
+        await pilot.press("enter")  # an empty objection objects to nothing
+        await pilot.pause()
+        assert isinstance(app.screen, ObjectionScreen)
+
+        await pilot.press("escape")
+        await wait_for(lambda: app.screen is merge)
+        assert app.screen is merge
+        assert merge.query_one("#merge-card").display
+        assert len(merge._selected) == 1
+
+        await pilot.press("escape")
+        await wait_for(lambda: app._settled)
+
+    assert app.debate.budget.extra_rounds == 0
+    assert not any(entry.merged for entry in snapshotter.summary())
+
+
+async def test_object_gets_a_button_only_where_there_is_room_for_one(tmp_path):
+    """Below the measured width `o` still works, and says so on its own line."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(130, 34)) as pilot:
+        await settle(app)
+        screen = MergeScreen(
+            many_candidates(tmp_path, 3),
+            run_branch="dai/run1",
+            object_with=objection_screen(tmp_path),
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+
+        for width, roomy in ((130, True), (97, True), (96, False), (80, False),
+                             (72, False), (64, False)):
+            await pilot.resize_terminal(width, 34)
+            for _ in range(3):
+                await pilot.pause()
+            button = screen.query_one("#merge-object", Button)
+            hint = screen.query_one("#merge-object-hint", Cell)
+            assert button.display is roomy, f"button wrong at {width} columns"
+            assert hint.display is (not roomy), f"hint wrong at {width} columns"
+            go = screen.query_one("#merge-go", Button)
+            toggle = screen.query_one("#merge-toggle", Button)
+            assert go.region.width == toggle.region.width, f"uneven at {width}"
+            assert answerable(screen) == [], f"cut off at {width} columns"
+            if roomy:
+                card = screen.query_one("#merge-card").content_region
+                assert button.region.right <= card.right, f"spills at {width}"
+                assert button.region.x > toggle.region.right, f"touching at {width}"
+
+
+async def test_a_long_note_on_a_short_terminal_never_hides_the_way_to_send_it(
+    tmp_path,
+):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+    rows = many_candidates(tmp_path, 3)
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await settle(app)
+        screen = ObjectionScreen(rows, rounds_done=4, cwd=tmp_path)
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one(CompletingInput).input.insert(
+            "\n".join(f"line {n} of a note that goes on" for n in range(10))
+        )
+
+        for size in ((100, 40), (100, 34), (100, 28), (100, 24), (80, 24), (130, 50)):
+            await pilot.resize_terminal(*size)
+            for _ in range(3):
+                await pilot.pause()
+            visible = app.screen._compositor.visible_widgets
+            for name in ("#objection-go", "#objection-actions", "#objection-title"):
+                widget = screen.query_one(name)
+                assert widget in visible, f"{name} cut off at {size[0]}x{size[1]}"
+                card = screen.query_one("#objection-card").region
+                assert widget.region.bottom <= card.bottom, f"{name} at {size}"
+
+
+async def test_an_objection_nobody_can_afford_says_why_instead(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(130, 34)) as pilot:
+        await settle(app)
+        screen = MergeScreen(
+            many_candidates(tmp_path, 1),
+            run_branch="dai/run1",
+            object_with=objection_screen(tmp_path),
+            blocked="budget exhausted: $5.00 of $5.00",
+        )
+        app.push_screen(screen)
+        for _ in range(3):
+            await pilot.pause()
+
+        assert screen.query_one("#merge-object", Button).disabled
+        hint = screen.query_one("#merge-object-hint", Cell)
+        assert hint.display and "budget exhausted" in drawn(hint)
+
+        await pilot.press("o")
+        await pilot.pause()
+        assert app.screen is screen
+
+
+async def test_the_way_out_is_in_the_footnote_not_among_the_buttons(tmp_path):
+    """Two controls, a line of text, then a third read as a fourth control."""
+
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(130, 34)) as pilot:
+        await settle(app)
+        screen = MergeScreen(
+            many_candidates(tmp_path, 2),
+            run_branch="dai/run1",
+            object_with=objection_screen(tmp_path),
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+
+        row = screen.query_one("#merge-actions")
+        assert [w.id for w in row.children] == [
+            "merge-go", "merge-toggle", "merge-spacer", "merge-object"
+        ]
+        footnote = drawn(screen.query_one("#merge-footnote", Cell), 90)
+        assert "Nothing is written until you choose" in footnote
+        assert "esc" in footnote and "Keep branches" in footnote
+
+        await pilot.press("escape")  # and it still does what it says
+        await pilot.pause()
+        assert app.screen is not screen
+
+
+async def test_without_a_way_to_object_the_question_is_the_old_one(tmp_path):
+    app, _ = make_app(tmp_path, [solved()], [approve()])
+
+    async with app.run_test(size=(130, 34)) as pilot:
+        await settle(app)
+        screen = MergeScreen(many_candidates(tmp_path, 1), run_branch="dai/run1")
+        app.push_screen(screen)
+        await pilot.pause()
+
+        assert not screen.query("#merge-object")
+        await pilot.press("o")
+        await pilot.pause()
+        assert app.screen is screen
+
+
+async def test_killing_the_extra_round_records_it_and_never_merges(tmp_path):
+    solver = Hanging("solver-engine", [solved()])
+    app, debate, snapshotter, repo = objecting_run(tmp_path, solver)
+    before = git_out("rev-parse", "main", cwd=repo)
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        await reach_the_question(app, pilot)
+        await object_with(app, pilot)
+        await pilot.press("enter")
+        await asyncio.wait_for(solver.hung.wait(), timeout=5)
+
+        await pilot.press("q")
+        await wait_for(lambda: isinstance(app.screen, ConfirmQuitScreen))
+        await pilot.click("#kill")
+        await wait_for(lambda: not app.is_running)
+
+    assert app.result is not None and app.result.outcome is Outcome.ABORTED
+    assert git_out("rev-parse", "main", cwd=repo) == before
+    assert not any(entry.merged for entry in snapshotter.summary())
 
 
 # --- layout regression ----------------------------------------------------

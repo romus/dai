@@ -39,6 +39,7 @@ _PHASE_COLOR = {
     "reviewing": "critic",
     "paused": "warning",
     "waiting for you": "warning",
+    "extra round": "warning",
     "killing agents": "error",
     "agreed": "success",
     "deadlocked": "warning",
@@ -73,6 +74,9 @@ class StatusBar(Horizontal):
         super().__init__(**kwargs)
         self.round = 0
         self.max_rounds = 0
+        #: Rounds a person asked for after an agreement. Shown beside the
+        #: count rather than in it: they are not spent out of the limit.
+        self.extra = 0
         self.phase = "starting"
         self.spent = 0.0
         self.limit: float | None = None
@@ -110,6 +114,8 @@ class StatusBar(Horizontal):
         line.append("│  ", style=theme.S_DIM_RULE)
         line.append("round ", style=theme.S_MUTED)
         line.append(f"{self.round}/{self.max_rounds}", style=theme.S_TEXT)
+        if self.extra:
+            line.append(f" +{self.extra} extra", style=theme.style("plain-warning"))
         line.append("  ")
         line.append_text(theme.meter(self.round, self.max_rounds))
         line.append(f"  {money}", style=theme.S_MUTED)
@@ -126,8 +132,10 @@ class StatusBar(Horizontal):
         self.phase = phase
         self.refresh_bar()
 
-    def set_round(self, number: int) -> None:
+    def set_round(self, number: int, extra: int | None = None) -> None:
         self.round = number
+        if extra is not None:
+            self.extra = extra
         self.refresh_bar()
 
     def set_spend(self, spent: float, exact: bool) -> None:
@@ -203,6 +211,9 @@ class AgentPane(Vertical):
         self._pending_text = ""
         self._activity = ""
         self._pulse = False
+        #: A line that is a state rather than work in progress — waiting on
+        #: the other side — sits still instead of beating.
+        self._steady = False
 
     @property
     def accent(self) -> str:
@@ -246,18 +257,23 @@ class AgentPane(Vertical):
 
     # --- what the pane is doing right now ---------------------------------
 
-    def set_activity(self, text: str | None) -> None:
-        """Show, change or clear the live line under the log."""
+    def set_activity(self, text: str | None, *, pulse: bool = True) -> None:
+        """Show, change or clear the live line under the log.
+
+        `pulse=False` is for a pane saying what it is waiting *for*: the
+        heartbeat means somebody is working, and nobody is.
+        """
 
         self._activity = text or ""
-        self._pulse = bool(text)
+        self._steady = not pulse
+        self._pulse = bool(text) and pulse
         activity = self.query_one(".pane-activity", Cell)
         activity.display = text is not None
         activity.refresh(layout=True)
 
     def _tick(self) -> None:
         activity = self.query_one(".pane-activity", Cell)
-        if not activity.display:
+        if not activity.display or self._steady:
             return
         self._pulse = not self._pulse
         activity.refresh()
@@ -528,7 +544,19 @@ class RepoRow(Static):
                 f"{item.refusal} — merge by hand", style=theme.style("plain-warning")
             )
         else:
-            detail = Text(self._files(), style=theme.S_MUTED)
+            detail = Text()
+            if item.since is not None and any(item.since):
+                # Which part of the counts above your objection bought. Ahead
+                # of the file names, since it is the reason you are back here.
+                plus, minus = item.since
+                bought = " ".join(
+                    part
+                    for part in (f"+{plus}" if plus else "", f"-{minus}" if minus else "")
+                    if part
+                )
+                detail.append(f"{bought} from your round", style=theme.WARNING)
+                detail.append("  ·  ", style=theme.S_MUTED)
+            detail.append(self._files(), style=theme.S_MUTED)
 
         # One grid, two rows. The second line shares the first's columns, so
         # both are cropped in the same place and neither can wrap the row onto
@@ -567,6 +595,52 @@ class RepoRow(Static):
 
     def on_click(self) -> None:
         self.post_message(self.Picked(self))
+
+
+class RulingBanner(Static):
+    """What you objected with, held over the panes for as long as it binds.
+
+    Two agents that had agreed are now working to a note of yours, and the one
+    thing worth seeing at a glance is what that note said. It paints at render
+    time, like every other line here, so a theme change needs only a refresh.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.note = ""
+        #: The ordinary round whose agreement the note overrides.
+        self.overrides = 0
+
+    def on_mount(self) -> None:
+        self.display = False
+
+    def show(self, note: str, overrides: int) -> None:
+        self.note = note
+        self.overrides = overrides
+        self.display = True
+        self.refresh(layout=True)
+
+    def hide(self) -> None:
+        self.display = False
+
+    def render(self) -> RenderResult:
+        body = Text()
+        body.append(self.note, style=theme.style("strong"))
+        body.append(
+            f"\nOverrides what they agreed in round {self.overrides}. "
+            "Everything else stays settled.",
+            style=theme.S_MUTED,
+        )
+        grid = Table.grid(expand=True, padding=(0, 2, 0, 0))
+        grid.add_column(no_wrap=True)
+        grid.add_column(ratio=1)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row(
+            Text(spaced("YOUR RULING"), style=theme.WARNING),
+            body,
+            Text("i to amend", style=theme.S_MUTED),
+        )
+        return grid
 
 
 @dataclass(frozen=True)

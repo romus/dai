@@ -85,6 +85,13 @@ class Budget:
         self._started = clock()
         self.spend = Spend()
         self.rounds = 0
+        #: Rounds a human asked for after the two had agreed. They are played
+        #: on top of the limit rather than out of it — being out of rounds is
+        #: not a reason to refuse the person the rounds were spent for.
+        self.extra_rounds = 0
+        #: Time spent waiting on a person, which no agent was burning.
+        self._held_since: float | None = None
+        self._held = 0.0
 
     # --- accounting -------------------------------------------------------
 
@@ -106,7 +113,27 @@ class Budget:
 
     @property
     def elapsed(self) -> float:
-        return self._clock() - self._started
+        held = self._held
+        if self._held_since is not None:
+            held += self._clock() - self._held_since
+        return self._clock() - self._started - held
+
+    def hold(self) -> None:
+        """Stop the wall clock while a person decides something.
+
+        The time limit is there to stop agents running away, not to charge
+        someone for reading a diff: without this, ten minutes on the merge
+        screen after a twenty-minute run would refuse them the extra round
+        they were deciding to ask for.
+        """
+
+        if self._held_since is None:
+            self._held_since = self._clock()
+
+    def release(self) -> None:
+        if self._held_since is not None:
+            self._held += self._clock() - self._held_since
+            self._held_since = None
 
     # --- gating -----------------------------------------------------------
 
@@ -137,8 +164,9 @@ class Budget:
         if (reason := self.resources_exhausted()) is not None:
             return reason
 
-        if self.rounds >= self.limits.max_rounds:
-            return f"round limit reached: {self.rounds} of {self.limits.max_rounds}"
+        counted = self.rounds - self.extra_rounds
+        if counted >= self.limits.max_rounds:
+            return f"round limit reached: {counted} of {self.limits.max_rounds}"
 
         return None
 
@@ -150,9 +178,19 @@ class Budget:
         which is worse than stopping cleanly one round earlier.
         """
 
-        if (reason := self.stop_reason()) is not None:
-            return reason
+        return self.stop_reason() or self._forecast()
 
+    def room_for_extra_round(self) -> str | None:
+        """Why a round a person asked for cannot be afforded, if it cannot.
+
+        The round limit does not apply — that is what makes it extra — but
+        money, tokens and time do, and so does the forecast: an extra round cut
+        off halfway leaves the same half-modified tree as any other.
+        """
+
+        return self.resources_exhausted() or self._forecast()
+
+    def _forecast(self) -> str | None:
         limits = self.limits
         if limits.max_usd is not None and self.spend.turns:
             forecast = self.spend.usd + self.spend.usd / self.spend.turns

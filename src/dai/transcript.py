@@ -425,7 +425,19 @@ def _count(value: object, one: str, many: str) -> str:
 
 
 def _render_round(rnd: Round) -> list[str]:
-    lines = [f"## Round {rnd.number}", ""]
+    if not rnd.objection:
+        lines = [f"## Round {rnd.number}", ""]
+    else:
+        # Said as loudly as the round itself: whatever changed here changed
+        # because a person said so, after the two had already agreed.
+        lines = [
+            f"## Round {rnd.number} — extra round, after your objection",
+            "",
+            "### Your objection",
+            "",
+            *(f"> {line}" if line else ">" for line in rnd.objection.splitlines()),
+            "",
+        ]
 
     if rnd.solver is not None:
         lines += ["### Solver", "", rnd.solver.summary or "_(no summary)_", ""]

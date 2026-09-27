@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dai.budget import Budget, Spend
@@ -17,8 +17,10 @@ from dai.models import (
     Issue,
     Outcome,
     Role,
+    Severity,
     SolverTurn,
     TurnResult,
+    Verdict,
 )
 from dai.protocol import (
     CRITIC_SCHEMA,
@@ -27,6 +29,8 @@ from dai.protocol import (
     arbitrated_prompt,
     critique_first_prompt,
     critique_next_prompt,
+    objection_prompt,
+    objection_review_prompt,
     parse_critic,
     parse_solver,
     prove_prompt,
@@ -43,6 +47,34 @@ DEADLOCK_POLICIES = ("critic", "solver", "ask")
 Ruling = dict[str, str]
 
 SIDES = ("critic", "solver")
+
+#: The id a human's objection goes by. It reaches the solver as an issue so that
+#: it is answered through the same schema as any other, and the critic checks
+#: that answer the way it checks any other.
+OBJECTION_ID = "you"
+
+
+@dataclass(frozen=True)
+class Objection:
+    """What a merge prompt answers when the person will not take the work yet.
+
+    Both frontends return it in place of the repositories to merge; the note is
+    what the agents receive — paths already swapped in for any `[ImgN]`.
+    """
+
+    note: str
+
+
+@dataclass(frozen=True)
+class ObjectionRecap:
+    """How the latest objection went, for the merge prompt it returns to."""
+
+    note: str
+    #: What the solver said it did about it, in its own words.
+    answer: str
+    #: "addressed", "open", or "dismissed" — the last when the person struck
+    #: their own note at a later deadlock.
+    status: str
 
 
 def as_ruling(answer: Ruling | str, issues: list[Issue]) -> Ruling:
@@ -67,13 +99,15 @@ class Round:
     critic: CriticTurn | None = None
     assessment: Assessment | None = None
     notes: list[str] = field(default_factory=list)
+    #: The note a person objected with, on the extra round it bought.
+    objection: str = ""
 
 
 @dataclass
 class DebateEvent:
     """Progress report for the UI."""
 
-    kind: str  # round | turn_start | turn_end | verdict | note | finished
+    kind: str  # turn_start | turn_end | verdict | note | objection | finished
     round: int = 0
     role: Role | None = None
     engine: str = ""
@@ -153,6 +187,11 @@ class Debate:
         self._emptied: set[int] = set()
         #: Whether the softer of the referee's two approval rules has been spent.
         self._challenged = False
+        #: Every objection a person made after an agreement, as the issue it
+        #: became. Held open against the critic for the rest of the run: see
+        #: `_hold_to_note`.
+        self._objections: list[Issue] = []
+        self._pinned: set[str] = set()
 
     # --- control ----------------------------------------------------------
 
@@ -213,7 +252,103 @@ class Debate:
         if solver_turn is None:
             return self._finish(Outcome.FAILED, "the solver produced no usable result")
 
-        previous_critique: CriticTurn | None = None
+        return await self._argue(current, solver_turn, None)
+
+    async def overrule(self, note: str) -> DebateResult:
+        """A person read what the two agreed, and will not take it yet.
+
+        One extra round, played on top of the round limit rather than out of
+        it: the solver applies the note as a ruling, and the critic checks the
+        result against it. That round is judged like any other — agreement
+        brings the merge question back, and anything else carries on into the
+        ordinary argument, because the only thing that may open a merge is
+        agreement.
+
+        Call only once `run()` (or a previous `overrule()`) has returned.
+        """
+
+        issue = Issue(id=OBJECTION_ID, severity=Severity.BLOCKER, claim=note.strip())
+        self._objections.append(issue)
+        self._pinned.add(issue.fingerprint)
+        # A note is the person's own word; a strike from an earlier deadlock
+        # that happens to match it must not swallow it before anyone reads it.
+        self._struck.pop(issue.fingerprint, None)
+        # An `accept` pressed during the last critique stops nothing — the
+        # argument settled first — but it is still set, and would end this
+        # round before it began. Asking for more work outranks it.
+        self._stopped = False
+
+        self.budget.extra_rounds += 1
+        # The argument had ended; whatever stall the referee was counting ended
+        # with it, and this round starts from something new.
+        self.referee.forget_progress()
+
+        current = Round(number=len(self.rounds) + 1, objection=issue.claim)
+        self.rounds.append(current)
+        self._emit(DebateEvent(kind="objection", round=current.number, text=issue.claim))
+
+        await self._gate(current.number)
+        if self._stopped:
+            return self._finish(Outcome.ABORTED, "stopped by the user")
+        solver_turn = await self._rebut(current, [issue])
+        if solver_turn is None:
+            return self._finish(Outcome.FAILED, "the solver stopped responding")
+
+        # As if the critic had raised the note itself last round: that is what
+        # makes the next critique the ordinary re-check of a claimed fix.
+        pending = CriticTurn(verdict=Verdict.REQUEST_CHANGES, issues=[issue])
+        return await self._argue(current, solver_turn, pending)
+
+    def objection_blocked(self) -> str | None:
+        """Why an extra round cannot be afforded now, or None if it can."""
+
+        return self.budget.room_for_extra_round()
+
+    def objection_recap(self) -> ObjectionRecap | None:
+        """How the latest objection fared, or None if there has been none."""
+
+        if not self._objections:
+            return None
+        issue = self._objections[-1]
+        rnd = next((r for r in reversed(self.rounds) if r.objection), None)
+        answer = ""
+        if rnd is not None and rnd.solver is not None:
+            reply = rnd.solver.reply_to(OBJECTION_ID)
+            answer = reply.detail if reply and reply.detail else rnd.solver.summary
+
+        if issue.fingerprint in self._struck:
+            status = "dismissed"
+        else:
+            last = next((r.critic for r in reversed(self.rounds) if r.critic), None)
+            still = last is not None and any(
+                self._is_note(i) for i in last.open_issues
+            )
+            status = "open" if still else "addressed"
+        return ObjectionRecap(note=issue.claim, answer=answer, status=status)
+
+    def is_extra(self, number: int) -> bool:
+        """Whether round `number` was one a person asked for after agreement."""
+
+        return 0 < number <= len(self.rounds) and bool(self.rounds[number - 1].objection)
+
+    def counted_round(self, number: int) -> int:
+        """Round `number` as the limit counts it: extra rounds are not counted.
+
+        An extra round reports the ordinary round it follows, so that a status
+        line reads "round 4/5 +1 extra" rather than claiming a fifth round of
+        five was used up.
+        """
+
+        extras = sum(1 for n in range(1, number + 1) if self.is_extra(n))
+        return number - extras
+
+    async def _argue(
+        self,
+        current: Round,
+        solver_turn: SolverTurn,
+        previous_critique: CriticTurn | None,
+    ) -> DebateResult:
+        """Critique, judge, rebut — until someone calls it."""
 
         while True:
             if self._stopped:
@@ -305,7 +440,14 @@ class Debate:
 
     async def _rebut(self, rnd: Round, issues: list[Issue]) -> SolverTurn | None:
         final = self._is_final_round(rnd.number)
-        if self._upheld:
+        if rnd.objection:
+            # A person overruled an agreement. Nothing else is owed this turn:
+            # `issues` is the note, and a pending deadlock ruling cannot exist,
+            # since the argument had ended.
+            prompt = objection_prompt(
+                issues[0], language=self.language, rigor=self.rigor
+            )
+        elif self._upheld:
             # A person ruled on these, so this turn answers them rather than the
             # critic. Binding for exactly one turn: the argument resumes after.
             prompt = arbitrated_prompt(
@@ -343,6 +485,14 @@ class Debate:
         if previous is None:
             prompt = critique_first_prompt(
                 self.task, solver, language=self.language, rigor=self.rigor
+            )
+        elif rnd.objection:
+            prompt = objection_review_prompt(
+                rnd.number,
+                previous.open_issues[0],
+                solver,
+                language=self.language,
+                rigor=self.rigor,
             )
         else:
             # Open issues only. The critic is told to keep the ones it conceded
@@ -390,9 +540,49 @@ class Debate:
         if critique is not None:
             critique = await self._prove(rnd, critique, solver)
             self._strike(rnd, critique)
+            self._hold_to_note(rnd, critique)
 
         rnd.critic = critique
         return critique
+
+    def _is_note(self, issue: Issue) -> bool:
+        return issue.id == OBJECTION_ID or issue.fingerprint in self._pinned
+
+    def _hold_to_note(self, rnd: Round, critique: CriticTurn) -> None:
+        """Keep a person's objection open until the critic says it is done.
+
+        The critic is told the note is a ruling it may only verify, but the
+        referee reads verdicts, not intentions, and there are three ways past
+        it: APPROVE while still filing the note, which settles regardless;
+        re-filing it as `minor`, which settles once only minors remain; and
+        listing it under `conceded`, which drops it from the open set. Each is
+        undone here, before anyone judges — the same place, and for the same
+        reason, that `_strike` runs. An approval that leaves the person's
+        ruling open is not agreement, any more than a round emptied by striking
+        is.
+        """
+
+        if not self._pinned or not critique.issues:
+            return
+        held = False
+        for index, issue in enumerate(critique.issues):
+            if not self._is_note(issue):
+                continue
+            held = True
+            if issue.severity is not Severity.BLOCKER:
+                critique.issues[index] = replace(issue, severity=Severity.BLOCKER)
+            if issue.id in critique.conceded:
+                critique.conceded = [c for c in critique.conceded if c != issue.id]
+                rnd.notes.append(f"[{issue.id}] cannot be conceded — it is your ruling")
+        if held and critique.verdict is Verdict.APPROVE:
+            critique.verdict = Verdict.REQUEST_CHANGES
+            note = "critic approved but left your note open; it stands until it is done"
+            rnd.notes.append(note)
+            self._emit(
+                DebateEvent(
+                    kind="note", round=rnd.number, engine=self.critic.name, text=note
+                )
+            )
 
     def _strike(self, rnd: Round, critique: CriticTurn) -> bool:
         """Drop what a human already dismissed, and say whether any were.
@@ -563,6 +753,8 @@ class Debate:
         ]
         for issue in dismissed:
             self._struck[issue.fingerprint] = issue
+            # Your own note, dismissed by you: the later word wins.
+            self._pinned.discard(issue.fingerprint)
         self._strike(rnd, critique)
         upheld = list(critique.open_issues)
 
@@ -668,7 +860,7 @@ class Debate:
     # --- helpers ----------------------------------------------------------
 
     def _is_final_round(self, number: int) -> bool:
-        return number >= self.budget.limits.max_rounds
+        return self.counted_round(number) >= self.budget.limits.max_rounds
 
     def _note_referee(self, rnd: Round, assessment: Assessment) -> None:
         if assessment.rubber_stamp:

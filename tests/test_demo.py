@@ -16,10 +16,11 @@ from dai import demo
 from dai.__main__ import build_parser
 from dai.demo.engine import FakeEngine
 from dai.demo.fiction import BRANCH, PretendSnapshotter, candidates
-from dai.demo.script import CRITIQUES, SOLVES
+from dai.demo.script import CRITIQUES, ENCORE_CRITIQUE, ENCORE_SOLVE, SOLVES
 from dai.models import Access, Outcome
 from dai.transcript import Transcript
-from dai.tui.app import DeadlockScreen, MergeScreen
+from dai.tui.app import DeadlockScreen, MergeScreen, ObjectionScreen
+from dai.tui.completion import CompletingInput
 from dai.tui.widgets import RepoRow, VerdictLog
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,63 @@ async def test_the_demo_writes_absolutely_nothing(tmp_path, dai_home):
 
     assert list(tmp_path.iterdir()) == [], "the demo left something behind"
     assert not dai_home.exists(), "the demo wrote into ~/.dai"
+
+
+async def object_in_the_demo(app, pilot, note: str = "say beta, not blank"):
+    merge = await reach_the_merge(app)
+    await pilot.press("o")
+    objection = await reach(app, ObjectionScreen)
+    objection.query_one(CompletingInput).input.insert(note)
+    await pilot.pause()
+    await pilot.press("enter")
+    for _ in range(300):
+        if isinstance(app.screen, MergeScreen) and app.screen is not merge:
+            return app.screen
+        await asyncio.sleep(0.05)
+    raise AssertionError("the demo never came back to the merge question")
+
+
+async def test_objecting_in_the_demo_writes_nothing_either(tmp_path, dai_home):
+    """The extra round runs through the same fiction: no file, no git, no home."""
+
+    app, snapshotter = demo_app(tmp_path)
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        await rule_the_deadlock(app, pilot)
+        await object_in_the_demo(app, pilot)
+        await pilot.press("enter")
+        await settled(app)
+
+    assert snapshotter.objections == 1
+    assert list(tmp_path.iterdir()) == [], "the demo left something behind"
+    assert not dai_home.exists(), "the demo wrote into ~/.dai"
+
+
+async def test_the_demo_can_be_objected_to_as_often_as_you_like(tmp_path):
+    app, snapshotter = demo_app(tmp_path)
+
+    async with app.run_test(size=(130, 40)) as pilot:
+        await rule_the_deadlock(app, pilot)
+        await object_in_the_demo(app, pilot)
+        again = await object_in_the_demo(app, pilot, "and the port too")
+
+        assert again.recap is not None and again.recap.status == "addressed"
+        assert again.candidates[0].since == (13, 3)
+        await pilot.press("escape")
+        await settled(app)
+
+    assert app.result.outcome is Outcome.CONSENSUS
+    assert app.debate.budget.extra_rounds == 2
+
+
+def test_the_encore_agrees_without_being_challenged():
+    """Same rule as the script: the approval names the file the solver changed."""
+
+    changed = ENCORE_SOLVE["files_changed"][0]
+
+    assert ENCORE_CRITIQUE["verdict"] == "APPROVE"
+    assert any(changed in line for line in ENCORE_CRITIQUE["checked"])
+    assert ENCORE_SOLVE["responses"][0]["id"] == "you"
 
 
 async def test_the_fake_engine_writes_nothing_even_when_told_it_may(tmp_path):

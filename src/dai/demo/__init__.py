@@ -20,7 +20,7 @@ from dai.budget import Budget, Limits
 from dai.consensus import Referee
 from dai.demo.engine import FakeEngine
 from dai.demo.fiction import PretendSnapshotter
-from dai.demo.script import CRITIQUES, SOLVES, TASK
+from dai.demo.script import CRITIQUES, ENCORE_CRITIQUE, ENCORE_SOLVE, SOLVES, TASK
 from dai.orchestrator import Debate
 from dai.transcript import Transcript
 # Textual, at module level: `__main__` imports this package only when --demo is
@@ -91,6 +91,8 @@ def _debate(cwd: Path) -> Debate:
     solver.name, critic.name = "solver (demo)", "critic (demo)"
     solver.solves = list(SOLVES)
     critic.critiques = list(CRITIQUES)
+    solver.encore_solve = ENCORE_SOLVE
+    critic.encore_critique = ENCORE_CRITIQUE
     return Debate(
         task=TASK,
         cwd=cwd,

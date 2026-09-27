@@ -125,6 +125,9 @@ class MergeCandidate:
     files: tuple[str, ...] = ()
     #: Why this one cannot go. Empty means it can.
     refusal: str = ""
+    #: Lines added and removed since the person last objected — the part of
+    #: `added`/`removed` their extra round wrote. None when nobody objected.
+    since: tuple[int, int] | None = None
 
     @property
     def mergeable(self) -> bool:
@@ -393,6 +396,9 @@ class Snapshotter:
         self._counts: dict[Path, int] = {}
         #: What `merge` did, per repository: (moved, why it did not).
         self._merged: dict[Path, tuple[bool, str]] = {}
+        #: Where each repository stood when the person last objected; None
+        #: until somebody has. See `mark`.
+        self._marks: dict[Path, str] | None = None
         if self.settings.enabled:
             self.repos = find_repos(
                 cwd, depth=self.settings.scan_depth, ignore=self.settings.ignore
@@ -519,6 +525,16 @@ class Snapshotter:
 
     # --- adopting the work ------------------------------------------------
 
+    def mark(self) -> None:
+        """Remember where every repository stands, before an extra round.
+
+        So the merge prompt that follows can say which part of each diff the
+        person's own objection bought. Read-only, like `preview`: it records
+        tips we already hold and asks git nothing.
+        """
+
+        self._marks = dict(self._tips)
+
     def preview(self) -> list[MergeCandidate]:
         """What each repository is offering to merge, and whether it can.
 
@@ -530,9 +546,12 @@ class Snapshotter:
 
         rows = []
         for entry in self.summary():
+            since = None
             try:
                 refusal = self._refusal(entry)
                 added, removed, files = self._diffstat(entry)
+                if self._marks is not None:
+                    since = self._since(entry)
             except (SnapshotError, OSError) as exc:
                 refusal, added, removed, files = str(exc), 0, 0, ()
             rows.append(
@@ -545,6 +564,7 @@ class Snapshotter:
                     removed=removed,
                     files=files,
                     refusal=refusal,
+                    since=since,
                 )
             )
         return rows
@@ -662,12 +682,32 @@ class Snapshotter:
         left = entry.base or self._tree_of(entry.repo, "")
         if not left:
             return 0, 0, ()
+        return self._numstat(entry.repo, left, entry.branch)
 
+    def _since(self, entry: RepoResult) -> tuple[int, int]:
+        """Lines either way since the last objection, in this repository.
+
+        A repository the extra round touched for the first time has its mark
+        set where its branch was rooted (see `_capture_one`), so it counts
+        from there — not from before your own work in progress.
+        """
+
+        mark = (self._marks or {}).get(entry.repo, "")
+        # No mark means no history to root on when the extra round began: a
+        # repository born during it, whose every line that round wrote.
+        added, removed, _ = (
+            self._numstat(entry.repo, mark, entry.branch)
+            if mark
+            else self._diffstat(entry)
+        )
+        return added, removed
+
+    def _numstat(
+        self, repo: Path, left: str, right: str
+    ) -> tuple[int, int, tuple[str, ...]]:
         added = removed = 0
         files: list[str] = []
-        listed = git(
-            "diff", "--numstat", left, entry.branch, cwd=entry.repo, check=False
-        )
+        listed = git("diff", "--numstat", left, right, cwd=repo, check=False)
         for line in listed.splitlines():
             plus, _, rest = line.partition("\t")
             minus, _, name = rest.partition("\t")
@@ -750,6 +790,9 @@ class Snapshotter:
 
         if not switched:
             parent = self._begin(repo)
+            if self._marks is not None:
+                # First touched after an objection: all of it is that round's.
+                self._marks.setdefault(repo, parent)
 
         commit = self._commit(repo, tree, parent, message)
         branch = self._point(repo, commit, label)

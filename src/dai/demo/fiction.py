@@ -24,18 +24,24 @@ BRANCH = "dai/demo"
 REPOS = ("service", "packages/engine", "vendor/prompts")
 
 
-def candidates(root: Path) -> list[MergeCandidate]:
+def candidates(root: Path, objections: int = 0) -> list[MergeCandidate]:
     """What the run would offer to merge, if any of this were real.
 
     The third one cannot go. That row — the reason spelled out, the tick
     withheld — is the state a real run cannot be talked into producing on
     demand, so the one place it can be shown reliably is here.
+
+    Each objection you make grows the first row a little, and says so: the
+    part of a diff your own note bought is what the dialog shows on the way
+    back, and a demo that objected into an unchanged diff would be lying.
     """
 
     return [
         MergeCandidate(
             repo=root / REPOS[0], label=REPOS[0], branch=BRANCH, base_branch="main",
-            added=318, removed=41, files=("index.html", "primes.html"),
+            added=318 + 13 * objections, removed=41 + 3 * objections,
+            files=("index.html", "primes.html"),
+            since=(13, 3) if objections else None,
         ),
         MergeCandidate(
             repo=root / REPOS[1], label=REPOS[1], branch=BRANCH, base_branch="develop",
@@ -67,6 +73,8 @@ class PretendSnapshotter(Snapshotter):
         #: What you picked, kept only so the closing note can say so.
         self.chosen: tuple[Path, ...] = ()
         self.declined = False
+        #: How many extra rounds you asked for.
+        self.objections = 0
 
     @property
     def active(self) -> bool:
@@ -88,8 +96,11 @@ class PretendSnapshotter(Snapshotter):
     def capture_final(self, label: str = "") -> SnapshotReport:
         return SnapshotReport(label=label)
 
+    def mark(self) -> None:
+        self.objections += 1
+
     def preview(self) -> list[MergeCandidate]:
-        return candidates(self.cwd)
+        return candidates(self.cwd, self.objections)
 
     def merge(self, *, only=None, kept: str = "") -> list[RepoResult]:
         picked = tuple(candidates(self.cwd)) if only is None else tuple(only)

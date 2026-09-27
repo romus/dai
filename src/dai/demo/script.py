@@ -1,4 +1,4 @@
-"""The argument the demo plays: two rounds, then agreement.
+"""The argument the demo plays: two rounds, then agreement — and an encore.
 
 Written against the referee's real rules rather than around them — an approval
 whose `checked` is empty is rejected outright, and one whose prose names none of
@@ -85,3 +85,20 @@ CRITIQUES = [
         "summary": "every cell now matches the source",
     },
 ]
+
+# The extra round, if you object at the merge dialog — played every time you do,
+# whatever you wrote. Both halves name the file the other one will look for: the
+# solver answers under the objection's id, and the critic's `checked` names the
+# file the solver says it changed, or the referee would spend a turn on it.
+ENCORE_SOLVE = _solved(
+    "applied your note on top of what we had agreed",
+    _replies(("you", "FIXED", f"changed {SUBJECT} as your note asks; nothing else moved")),
+)
+
+ENCORE_CRITIQUE = {
+    "verdict": "APPROVE",
+    "checked": [f"re-read {SUBJECT} against your note", "re-checked every other cell"],
+    "issues": [],
+    "conceded": [],
+    "summary": "your note is applied, and nothing that was settled came undone",
+}

@@ -1,6 +1,6 @@
 [project]
 name = "dai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Two CLI agents argue about your task until they agree"
 readme = "README.md"
 requires-python = ">=3.11"
