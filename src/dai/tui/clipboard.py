@@ -26,8 +26,6 @@ import re
 import sys
 from pathlib import Path
 
-from dai.snapshot import ignore_locally, toplevel
-
 #: A clipboard read that has not answered by now is not going to. The number is
 #: generous for the work (one `osascript` is tens of milliseconds) and small
 #: enough that a wedged helper costs a noticeable pause, not the session.
@@ -200,19 +198,14 @@ class Attachments:
     # --- internals --------------------------------------------------------
 
     def _ensure(self) -> bool:
-        """Make the directory, and hide it from git before anything is in it."""
+        """Make the directory. Under `~/.dai`, so nothing needs hiding from git."""
 
         try:
             self.images_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
-            # Same bargain the transcript strikes: a workspace we cannot write
-            # to costs the feature, not the run.
+            # Same bargain the transcript strikes: a home we cannot write to
+            # costs the feature, not the run.
             return False
-        # `__main__` does this too, later. Here is where it has to happen as
-        # well, because a pasted picture is now the first thing dai writes —
-        # earlier than the transcript, and earlier than the first snapshot.
-        if (repo := toplevel(self.workspace)) is not None:
-            ignore_locally(repo, ".dai/")
         return True
 
     def _next_number(self) -> int:
@@ -241,8 +234,10 @@ class Attachments:
     def _reference(self, dest: Path) -> str:
         """How the path is written into the prompt the agents receive.
 
-        Relative to the workspace when it can be — that is what the engines are
-        given as `cwd`, and it is the same shape `@` completion inserts.
+        Absolute, in practice: the run's directory is under `~/.dai`, outside
+        the workspace, and the engines are told they may read it. Relative only
+        if `DAI_HOME` has been put inside the workspace — that is what the
+        engines are given as `cwd`, and the shape `@` completion inserts.
         """
 
         try:

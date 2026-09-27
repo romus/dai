@@ -46,7 +46,7 @@ def run(cwd: Path, *, appearance: str = "dark") -> int:
     app = _DemoApp(
         _debate(cwd),
         cwd=cwd,
-        # Disabled, not redirected: the run must leave no `.dai/` behind either.
+        # Disabled, not redirected: the run must leave nothing in `~/.dai` either.
         transcript=Transcript(cwd, "demo", enabled=False),
         snapshotter=snapshotter,
         appearance=appearance,

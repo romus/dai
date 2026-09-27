@@ -78,7 +78,15 @@ class ClaudeEngine(Engine):
                 "acceptEdits" if access is Access.WRITE else "plan",
             ]
 
-        return argv + self.extra_args
+        argv += self.extra_args
+        # Last, because --add-dir takes any number of values: anywhere earlier
+        # it would take the next bare word for one more. Only for ones that exist
+        # — the argv is rebuilt every turn, so a screenshot pasted mid-run is
+        # readable from the next one, and a run with none looks as it always did.
+        for directory in self.read_dirs:
+            if directory.is_dir():
+                argv += ["--add-dir", str(directory)]
+        return argv
 
     def handle_event(self, event: dict, turn: _Turn) -> None:
         kind = event.get("type")

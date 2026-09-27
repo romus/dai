@@ -11,6 +11,7 @@ from test_clipboard import pretend
 from textual.app import App, ComposeResult
 
 from dai.config import from_dict
+from dai.transcript import run_dir
 from dai.tui.clipboard import Attachments
 from dai.tui.completion import (
     MAX_ENTRIES,
@@ -135,7 +136,9 @@ def test_a_plain_directory_is_walked_with_the_ignore_list(tmp_path):
     assert not any(p.startswith("node_modules") for p in paths)
 
 
-def test_dai_bookkeeping_is_never_offered(tmp_path):
+def test_an_old_checkout_s_dai_bookkeeping_is_never_offered(tmp_path):
+    """Runs used to be kept in `<workdir>/.dai`; plenty of checkouts still have one."""
+
     root = tmp_path / "plain"
     (root / ".dai" / "runs").mkdir(parents=True)
     (root / ".dai" / "runs" / "events.jsonl").write_text("{}")
@@ -519,7 +522,7 @@ async def test_with_debounce_off_every_keystroke_filters(repo):
 
 
 def box_for(repo: Path) -> Attachments:
-    return Attachments(repo, repo / ".dai" / "runs" / "run-1" / "images")
+    return Attachments(repo, run_dir(repo, "run-1") / "images")
 
 
 async def test_pasting_a_screenshot_leaves_a_token_not_a_path(monkeypatch, repo):
@@ -566,7 +569,7 @@ async def test_the_path_appears_only_in_what_the_agents_receive(monkeypatch, rep
         await settle(pilot)
 
         assert app.submitted == ["[Img1] fix"]
-        assert app.prompts == [".dai/runs/run-1/images/img1.png fix"]
+        assert app.prompts == [f"{run_dir(repo, 'run-1') / 'images' / 'img1.png'} fix"]
 
 
 async def test_pasting_text_inserts_it_and_writes_nothing(monkeypatch, repo):
@@ -585,7 +588,7 @@ async def test_pasting_text_inserts_it_and_writes_nothing(monkeypatch, repo):
 
 
 async def test_text_still_pastes_where_screenshots_are_switched_off(
-    monkeypatch, repo
+    monkeypatch, repo, dai_home
 ):
     """No attachments — the demo, and any workspace we cannot write to."""
 
@@ -600,6 +603,7 @@ async def test_text_still_pastes_where_screenshots_are_switched_off(
 
         assert widget.value == "still typed by hand"
         assert not (repo / ".dai").exists()
+        assert not dai_home.exists()
 
 
 async def test_pasting_into_the_middle_lands_at_the_cursor(monkeypatch, repo):

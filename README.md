@@ -23,7 +23,7 @@ rounds or budget run out.
 make install        # create the venv, install deps
 make demo           # watch a run without installing the agents or spending anything
 make doctor         # check uv / claude / codex are actually installed
-make init           # write ~/.config/dai/config.toml (annotated)
+make init           # write ~/.dai/config.toml (annotated)
 make test
 
 make run ARGS="'fill in the empty cells in docs/matrix.md from README.md'"
@@ -51,7 +51,8 @@ dai --no-tui "regenerate the CLI reference in docs/"
 dai --merge "bring the changelog up to date"      # merge back without asking
 dai --no-merge "bring the changelog up to date"   # leave it on the run's branch
 dai --branch-from current "tidy up the tests"     # branch off where I am, not the trunk
-dai --runs                                        # past runs; --show <id> prints one
+dai --runs                                        # past runs here; --all, --show <id>
+dai --clean                                       # delete them; --all, --older-than 30, --dry-run
 dai --snapshots                                   # branches those runs committed to
 dai --demo                                        # watch a canned run; costs and changes nothing
 ```
@@ -73,6 +74,12 @@ you get their proposals instead. `make smoke` runs a real argument in a throwawa
 sandbox — real model calls, so it costs a little.
 
 Exit codes: `0` agreed · `1` did not agree · `2` error.
+
+`dai` writes nothing of its own into your project: each run's log, report and pasted
+screenshots go to `~/.dai/projects/<directory>/runs/<run-id>/`, so there is nothing to
+add to `.gitignore`. `dai --clean` deletes the runs saved for the directory you are in
+(`--all` for every directory), asks before it does, and leaves alone any run that is still
+going. It also clears out the `.dai/runs` that older versions kept inside the project.
 
 ## TUI keys
 
@@ -111,7 +118,9 @@ mid-run theme change on terminals that report one. `--theme dark|light` pins one
 
 ## Config
 
-`~/.config/dai/config.toml`, created by `make init`, every option commented. Defaults:
+`~/.dai/config.toml`, created by `make init`, every option commented. A config still at
+the old `~/.config/dai/config.toml` keeps being read until `make init` copies it across.
+`DAI_HOME` moves the whole of `~/.dai` somewhere else. Defaults:
 `claude` solves, `codex` critiques, 5 rounds, $5.00, deadlock goes to the critic,
 per-round commits on, and on agreement you are asked what to merge. `rigor` sets how hard
 the two lean on each other — the evidence rules hold at every level, it is how far the

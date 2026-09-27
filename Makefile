@@ -70,11 +70,11 @@ run-swap: ## Run with the roles swapped (codex solves, claude critiques)
 	uv run dai --solver codex --critic claude $(ARGS)
 
 .PHONY: init
-init: ## Write the default config to ~/.config/dai/config.toml
+init: ## Write the default config to ~/.dai/config.toml (copying an old ~/.config/dai one)
 	uv run dai --init
 
 .PHONY: runs
-runs: ## List past runs recorded in the current directory
+runs: ## List past runs made in the current directory
 	uv run dai --runs
 
 .PHONY: snapshots
@@ -116,8 +116,8 @@ clean: ## Remove build artifacts and caches
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 
 .PHONY: clean-runs
-clean-runs: ## Delete recorded run transcripts in .dai/ (does NOT touch git snapshots)
-	rm -rf .dai/runs
+clean-runs: ## Delete this directory's saved runs from ~/.dai, asking first (does NOT touch git snapshots)
+	uv run dai --clean $(ARGS)
 
 .PHONY: clean-all
 clean-all: clean ## Remove everything including venv

@@ -22,10 +22,15 @@ from dai.orchestrator import DebateResult, Round
 from dai.snapshot import RepoResult
 from dai.transcript import (
     Transcript,
+    find_run,
+    list_all_runs,
     list_runs,
     new_run_id,
+    pid_alive,
     read_events,
     render_report,
+    run_dir,
+    run_started,
 )
 
 
@@ -92,18 +97,34 @@ def test_finish_writes_a_readable_report(tmp_path):
     assert "Round 1" in body and "Round 2" in body
 
 
-def test_a_read_only_workspace_does_not_break_the_run(tmp_path):
-    """Recording is a convenience; failing to record must not stop the argument."""
+def test_a_read_only_workspace_is_still_recorded(tmp_path, dai_home):
+    """The record lives under `~/.dai`, so the workspace is never written to."""
 
     blocked = tmp_path / "ro"
     blocked.mkdir()
     blocked.chmod(0o500)
     try:
         transcript = Transcript(blocked, "run1")
+        transcript.start(task="t", cwd=blocked, solver="claude", critic="codex")
+        assert transcript.enabled
+        assert (transcript.dir / "events.jsonl").is_file()
+        assert transcript.dir.is_relative_to(dai_home)
+        assert list(blocked.iterdir()) == []
+    finally:
+        blocked.chmod(0o700)
+
+
+def test_an_unwritable_home_does_not_break_the_run(tmp_path, dai_home):
+    """Recording is a convenience; failing to record must not stop the argument."""
+
+    parent = dai_home.parent
+    parent.chmod(0o500)
+    try:
+        transcript = Transcript(tmp_path, "run1")
         transcript.event("start")  # must not raise
         assert not transcript.enabled
     finally:
-        blocked.chmod(0o700)
+        parent.chmod(0o700)
 
 
 def test_non_ascii_survives_the_round_trip(tmp_path):
@@ -291,7 +312,7 @@ def test_an_unfinished_run_still_lists(tmp_path):
 def test_a_prompt_backed_out_of_is_not_a_run(tmp_path):
     """A screenshot pasted and then abandoned leaves the directory, not a run."""
 
-    images = tmp_path / ".dai" / "runs" / "20260101-000000-aaaa" / "images"
+    images = run_dir(tmp_path, "20260101-000000-aaaa") / "images"
     images.mkdir(parents=True)
     (images / "img1.png").write_bytes(b"x")
 
@@ -387,3 +408,99 @@ def test_the_branches_are_recorded_in_the_event_log(tmp_path):
     assert recorded[0]["repos"][0]["branch"] == "dai/run1"
     assert recorded[0]["repos"][0]["commits"] == 2
     assert recorded[0]["repos"][0]["repo"].endswith("api")
+
+
+
+# --- where runs live ------------------------------------------------------
+
+
+def record(workdir: Path, run_id: str, task: str = "t", *, finish: bool = True) -> Transcript:
+    t = Transcript(workdir, run_id)
+    t.start(task=task, cwd=workdir, solver="claude", critic="codex")
+    if finish:
+        t.finish(sample_result(), task=task, cwd=workdir, solver="claude", critic="codex")
+    return t
+
+
+def test_a_run_is_kept_under_the_dai_home_and_never_in_the_workdir(tmp_path, dai_home):
+    t = record(tmp_path, "run1")
+
+    assert t.dir.is_relative_to(dai_home / "projects")
+    assert (t.dir / "report.md").is_file()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_two_directories_do_not_see_each_other_s_runs(tmp_path):
+    api, web = tmp_path / "api", tmp_path / "web"
+    api.mkdir(), web.mkdir()
+    record(api, "20260101-000000-aaaa", "api work")
+    record(web, "20260102-000000-bbbb", "web work")
+
+    assert [r.task for r in list_runs(api)] == ["api work"]
+    assert [r.task for r in list_runs(web)] == ["web work"]
+    assert [r.task for r in list_all_runs()] == ["web work", "api work"]
+
+
+def test_a_run_remembers_where_it_worked_and_who_ran_it(tmp_path):
+    import os
+
+    record(tmp_path, "run1", finish=False)
+
+    info = list_runs(tmp_path)[0]
+    assert info.cwd == str(tmp_path)
+    assert info.pid == os.getpid()
+    assert not info.finished
+
+
+def test_a_run_is_found_here_first_and_then_anywhere(tmp_path):
+    here, there = tmp_path / "here", tmp_path / "there"
+    here.mkdir(), there.mkdir()
+    record(there, "20260101-000000-aaaa")
+
+    assert find_run("20260101-000000-aaaa", here) == run_dir(there, "20260101-000000-aaaa")
+    assert find_run("20260101-000000-zzzz", here) is None
+
+
+def test_a_run_id_cannot_walk_out_of_the_runs_directory(tmp_path):
+    record(tmp_path, "run1")
+
+    for hostile in ("../run1", "..", ".", "a/b", "*", ""):
+        assert find_run(hostile, tmp_path) is None
+
+
+def test_a_run_s_age_comes_from_its_id_or_else_its_directory(tmp_path):
+    from datetime import datetime
+
+    assert run_started("20260101-093000-aaaa", tmp_path) == datetime(2026, 1, 1, 9, 30)
+    stamp = datetime.fromtimestamp(tmp_path.stat().st_mtime)
+    assert run_started("run1", tmp_path) == stamp
+
+
+def test_only_a_real_pid_is_ever_signalled(monkeypatch):
+    """pid 0 is our own process group and -1 is everyone: never signal those."""
+
+    import os
+
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
+    for pid in (0, -1, None, "123", True, 1.5):
+        assert pid_alive(pid) is False
+    assert sent == []
+
+    assert pid_alive(4242) is True
+    assert sent == [4242]
+
+
+def test_a_dead_pid_is_dead_and_somebody_else_s_is_alive(monkeypatch):
+    import os
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    def foreign(pid, sig):
+        raise PermissionError
+
+    monkeypatch.setattr(os, "kill", gone)
+    assert pid_alive(4242) is False
+    monkeypatch.setattr(os, "kill", foreign)
+    assert pid_alive(4242) is True

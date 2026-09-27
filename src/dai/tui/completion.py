@@ -41,7 +41,8 @@ MAX_ENTRIES = 20_000
 DEFAULT_LIMIT = 50
 DEFAULT_DEBOUNCE_MS = 80
 
-#: Never worth offering, whatever the ignore settings say.
+#: Never worth offering, whatever the ignore settings say. `.dai` is where runs
+#: were kept before they moved to `~/.dai`, and old checkouts still have one.
 ALWAYS_SKIP = {".git", "__pycache__", ".dai"}
 
 #: Only the first of these survives every terminal. `shift+enter` needs the

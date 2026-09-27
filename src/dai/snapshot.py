@@ -210,33 +210,6 @@ def find_repos(root: Path, *, depth: int = 3, ignore: list[str] | None = None) -
     return found
 
 
-def ignore_locally(repo: Path, pattern: str) -> bool:
-    """Hide a path from git for this checkout only.
-
-    Written to `.git/info/exclude`, not `.gitignore`: dai's own bookkeeping is
-    nobody else's business, so it must not turn up in the user's diff, in their
-    commits, or in a colleague's checkout. Without this, `.dai/` shows up as
-    untracked in every `git status` and gets swept into our own commits.
-    """
-
-    git_dir = git("rev-parse", "--absolute-git-dir", cwd=repo, check=False)
-    if not git_dir:
-        return False
-
-    exclude = Path(git_dir) / "info" / "exclude"
-    try:
-        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if any(line.strip() == pattern for line in existing.splitlines()):
-            return False
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        prefix = "" if not existing or existing.endswith("\n") else "\n"
-        with exclude.open("a", encoding="utf-8") as handle:
-            handle.write(f"{prefix}# added by dai\n{pattern}\n")
-    except OSError:
-        return False
-    return True
-
-
 def flat_name(branch: str) -> str:
     """The name `_point` settles for when the slashed one cannot exist.
 

@@ -973,66 +973,22 @@ def test_branch_counts_survive_the_merge(tmp_path):
 # --- keeping our own footprint out of the user's git ----------------------
 
 
-def test_dai_directory_is_hidden_from_git_locally(tmp_path):
-    """`.dai/` must not show up as untracked in the user's `git status`."""
+def test_a_run_s_bookkeeping_never_reaches_the_user_s_repo(tmp_path, dai_home):
+    """The transcript lives in `~/.dai`: nothing to hide, nothing to sweep up."""
 
-    from dai.snapshot import ignore_locally
-
-    repo = make_repo(tmp_path / "proj")
-    (repo / ".dai" / "runs").mkdir(parents=True)
-    (repo / ".dai" / "runs" / "events.jsonl").write_text("{}\n")
-
-    assert run("status", "--porcelain", cwd=repo) != ""  # visible before
-    assert ignore_locally(repo, ".dai/") is True
-    assert run("status", "--porcelain", cwd=repo) == ""  # invisible after
-
-
-def test_local_ignore_does_not_touch_the_users_gitignore(tmp_path):
-    from dai.snapshot import ignore_locally
-
-    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n", ".gitignore": "*.log\n"})
-
-    ignore_locally(repo, ".dai/")
-
-    assert (repo / ".gitignore").read_text() == "*.log\n"
-    assert ".dai/" in (repo / ".git" / "info" / "exclude").read_text()
-
-
-def test_local_ignore_is_not_written_twice(tmp_path):
-    from dai.snapshot import ignore_locally
-
-    repo = make_repo(tmp_path / "proj")
-
-    assert ignore_locally(repo, ".dai/") is True
-    assert ignore_locally(repo, ".dai/") is False
-    body = (repo / ".git" / "info" / "exclude").read_text()
-    assert body.count(".dai/") == 1
-
-
-def test_ignored_bookkeeping_stays_out_of_commits(tmp_path):
-    from dai.snapshot import ignore_locally
+    from dai.transcript import Transcript
 
     repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
-    ignore_locally(repo, ".dai/")
-    (repo / ".dai").mkdir()
-    (repo / ".dai" / "events.jsonl").write_text("{}\n")
+    exclude = repo / ".git" / "info" / "exclude"
+    before = exclude.read_text() if exclude.exists() else ""
+
+    transcript = Transcript(repo, "run1")
+    transcript.start(task="t", cwd=repo, solver="s", critic="c")
     snap = Snapshotter(repo, "run1")
 
-    # Our own transcript is not a change to the user's work, so on its own it
-    # is not even worth a commit.
+    assert transcript.dir.is_relative_to(dai_home)
+    assert run("status", "--porcelain", cwd=repo) == ""
+    # Our own transcript is not a change to the user's work, so it is not
+    # even worth a commit.
     assert snap.capture("r1").taken == []
-
-    (repo / "a.txt").write_text("two\n")
-    taken = snap.capture("r2").taken[0]
-    listed = run("ls-tree", "-r", "--name-only", taken.commit, cwd=repo).split()
-
-    assert not any(name.startswith(".dai") for name in listed)
-
-
-def test_local_ignore_on_a_non_repository_is_harmless(tmp_path):
-    from dai.snapshot import ignore_locally
-
-    plain = tmp_path / "plain"
-    plain.mkdir()
-
-    assert ignore_locally(plain, ".dai/") is False
+    assert (exclude.read_text() if exclude.exists() else "") == before

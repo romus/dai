@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from dai import __version__, config as config_module
+from dai import __version__, cleanup, config as config_module
 from dai.budget import Budget, Limits
 from dai.config import Config, Merge, SnapshotConfig
 from dai.consensus import Referee
@@ -21,12 +21,18 @@ from dai.snapshot import (
     Snapshotter,
     describe,
     find_repos,
-    ignore_locally,
     list_branches,
     merge_promise,
-    toplevel,
 )
-from dai.transcript import Transcript, list_runs, new_run_id, run_dir
+from dai.transcript import (
+    Transcript,
+    find_run,
+    list_all_runs,
+    list_runs,
+    new_run_id,
+    pid_alive,
+    run_dir,
+)
 
 EXIT_OK = 0
 EXIT_DISAGREED = 1
@@ -52,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="both agents read-only; nothing on disk is modified",
+        help="both agents read-only; nothing on disk is modified "
+        "(with --clean: only list what would go)",
     )
     parser.add_argument(
         "--rigor",
@@ -91,6 +98,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init", action="store_true", help="write the default config and exit")
     parser.add_argument("--runs", action="store_true", help="list past runs here")
     parser.add_argument(
+        "--clean", action="store_true", help="delete the runs saved for this directory"
+    )
+    parser.add_argument(
+        "--all", action="store_true", help="with --clean or --runs: every directory's runs"
+    )
+    # A required value, unlike the optional one the note on --merge warns
+    # about: it takes exactly the next word, so it cannot swallow the task.
+    parser.add_argument(
+        "--older-than",
+        type=_days,
+        metavar="DAYS",
+        help="with --clean: keep the runs newer than this",
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="with --clean: do not ask first"
+    )
+    parser.add_argument(
         "--snapshots", action="store_true", help="list the branches dai committed to"
     )
     parser.add_argument("--show", metavar="RUN_ID", help="print a past run's report")
@@ -103,8 +127,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _days(text: str) -> float:
+    try:
+        days = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of days: {text!r}") from None
+    if not 0 <= days < float("inf"):
+        raise argparse.ArgumentTypeError(f"not a number of days: {text!r}")
+    return days
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if (args.older_than is not None or args.yes) and not args.clean:
+        parser.error("--older-than and --yes only mean something with --clean")
+    if args.all and not (args.clean or args.runs):
+        parser.error("--all only means something with --clean or --runs")
     cwd = (args.cwd or Path.cwd()).resolve()
 
     if args.demo:
@@ -114,13 +153,28 @@ def main(argv: list[str] | None = None) -> int:
 
         return demo.run(cwd, appearance=_appearance(args.theme or "auto"))
     if args.init:
-        path, added = config_module.ensure_config(args.config)
+        try:
+            # An explicit --config names the file to write, and nothing moves.
+            moved = None if args.config else config_module.migrate_legacy()
+            path, added = config_module.ensure_config(args.config)
+        except OSError as exc:
+            print(f"dai: cannot write the config: {exc}", file=sys.stderr)
+            return EXIT_ERROR
         print(f"config: {path}")
+        if moved is not None:
+            print(f"  copied from {moved} — no longer read; delete it when you like")
         for name in added:
             print(f"  added {name}")
         return EXIT_OK
+    if args.clean:
+        # Before the is_dir() guard: a project whose directory is gone is
+        # exactly the one whose runs are left over.
+        return _clean(
+            cwd, everywhere=args.all, older_than=args.older_than,
+            yes=args.yes, dry_run=args.dry_run,
+        )
     if args.runs:
-        return _list_runs(cwd)
+        return _list_runs(cwd, everywhere=args.all)
     if args.show:
         return _show_run(cwd, args.show)
     if args.snapshots:
@@ -145,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     # task goes into this run's own directory, which makes it the earliest
     # thing dai writes anywhere. The call itself creates nothing.
     run_id = new_run_id()
+    images = run_dir(cwd, run_id) / "images"
 
     task = _resolve_task(args)
     if not task and interactive:
@@ -154,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             cwd,
             debounce_ms=cfg.completion_debounce_ms,
             appearance=appearance,
-            images_dir=run_dir(cwd, run_id) / "images",
+            images_dir=images,
         )
     if not task:
         print('dai: give me a task, e.g. dai "fill in the table in docs/matrix.md"',
@@ -162,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
-        solver, critic = _build_engines(cfg, writing=not args.dry_run)
+        solver, critic = _build_engines(cfg, writing=not args.dry_run, read_dirs=(images,))
     except ValueError as exc:
         print(f"dai: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -175,10 +230,6 @@ def main(argv: list[str] | None = None) -> int:
         print("dai: `dai --demo` shows you a run without them", file=sys.stderr)
         return EXIT_ERROR
 
-    # Hide our own bookkeeping before anything writes it, so the first snapshot
-    # does not sweep it up and `git status` stays about the user's work.
-    if (repo := toplevel(cwd)) is not None:
-        ignore_locally(repo, ".dai/")
     transcript = Transcript(cwd, run_id)
     snapshotter = Snapshotter(cwd, run_id, cfg.snapshot)
 
@@ -286,7 +337,15 @@ def _apply_overrides(cfg: Config, args) -> Config:
     return cfg
 
 
-def _build_engines(cfg: Config, *, writing: bool) -> tuple[Engine, Engine]:
+def _build_engines(
+    cfg: Config, *, writing: bool, read_dirs: tuple[Path, ...] = ()
+) -> tuple[Engine, Engine]:
+    """Both engines. `read_dirs` is what they may read outside the workdir.
+
+    The run's pasted screenshots, today: they live under `~/.dai`, which is
+    outside the directory either agent is started in.
+    """
+
     solver_cfg = cfg.engine(cfg.solver)
     critic_cfg = cfg.engine(cfg.critic)
     solver = build_engine(
@@ -294,12 +353,14 @@ def _build_engines(cfg: Config, *, writing: bool) -> tuple[Engine, Engine]:
         cmd=solver_cfg.cmd or None,
         model=solver_cfg.model,
         extra_args=solver_cfg.args_for(writing=writing),
+        read_dirs=read_dirs,
     )
     critic = build_engine(
         cfg.critic,
         cmd=critic_cfg.cmd or None,
         model=critic_cfg.model,
         extra_args=critic_cfg.args_for(writing=False),
+        read_dirs=read_dirs,
     )
     return solver, critic
 
@@ -311,16 +372,106 @@ def _missing_binaries(*engines: Engine) -> list[str]:
 # --- past runs ------------------------------------------------------------
 
 
-def _list_runs(cwd: Path) -> int:
-    runs = list_runs(cwd)
+def _list_runs(cwd: Path, *, everywhere: bool = False) -> int:
+    runs = list_all_runs() if everywhere else list_runs(cwd)
     if not runs:
-        print("no runs recorded here")
-        return EXIT_OK
+        print("no runs recorded" if everywhere else "no runs recorded here")
     for info in runs:
-        outcome = info.outcome or "unfinished"
-        task = info.task if len(info.task) <= 60 else info.task[:59] + "…"
-        print(f"{info.run_id}  {outcome:<10}  {task}")
+        outcome = info.outcome or ("running" if pid_alive(info.pid) else "unfinished")
+        where = f"  {_colour(_tilde(info.cwd), DIM)}" if everywhere else ""
+        print(f"{info.run_id}  {outcome:<10}{where}  {_clip(info.task)}")
+    if (cwd / ".dai" / "runs").is_dir():
+        print(_colour(
+            "older runs in ./.dai/runs are not listed — `dai --clean` removes them", DIM
+        ))
     return EXIT_OK
+
+
+def _clean(cwd: Path, *, everywhere: bool, older_than: float | None,
+           yes: bool, dry_run: bool) -> int:
+    """Delete saved runs: list them, ask, delete. Never a run still going."""
+
+    found = cleanup.plan(cwd, everywhere=everywhere, older_than=older_than)
+
+    # Newest first within each directory, and the old layout last. Two sorts,
+    # because the second is stable and keeps the order the first one made.
+    rows = sorted(found.remove + found.running, key=lambda c: c.run_id, reverse=True)
+    rows.sort(key=lambda c: (c.legacy, c.where))
+    kept = {c.path for c in found.running}
+    heading = None
+    for candidate in rows:
+        if candidate.where != heading:
+            heading = candidate.where
+            print(_tilde(heading))
+        if candidate.path in kept:
+            why = (
+                f"still running (pid {candidate.pid})"
+                if candidate.pid is not None
+                else "touched in the last day, may be in use"
+            )
+            print(_colour(f"  ! {candidate.run_id}  {why} — kept", YELLOW))
+            continue
+        outcome = candidate.outcome or ("unfinished" if candidate.recorded else "abandoned")
+        print(
+            f"  {candidate.run_id}  {outcome:<10}  "
+            f"{_colour(f'{_size(candidate.size):>7}', DIM)}  {_clip(candidate.task)}"
+        )
+    if found.newer:
+        print(_colour(f"{_runs(found.newer)} newer than {older_than:g} days kept", DIM))
+
+    if not found.remove:
+        print("nothing to clean")
+        return EXIT_OK
+    total = f"{_runs(len(found.remove))}, {_size(found.size)}"
+    if dry_run:
+        print(_colour(f"{total} — dry run, nothing deleted", DIM))
+        return EXIT_OK
+
+    if not yes:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            sys.stdout.flush()  # the list first, then why nothing happened to it
+            print(
+                "dai: nobody to confirm with — pass --yes to delete, or --dry-run to look",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        try:
+            answer = input(f"delete {total}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("nothing deleted")
+            return EXIT_OK
+
+    freed, failures = cleanup.remove(found)
+    for path, reason in failures:
+        print(f"dai: could not delete {path}: {reason}", file=sys.stderr)
+    print(f"removed {_runs(len(found.remove) - len(failures))}, {_size(freed)}")
+    return EXIT_ERROR if failures else EXIT_OK
+
+
+def _runs(number: int) -> str:
+    return f"{number} run" if number == 1 else f"{number} runs"
+
+
+def _size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _clip(task: str, width: int = 60) -> str:
+    task = " ".join(task.split())
+    return task if len(task) <= width else task[: width - 1] + "…"
+
+
+def _tilde(path: str) -> str:
+    home = str(Path.home())
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
 
 
 def _list_snapshots(cwd: Path, settings: SnapshotConfig) -> int:
@@ -368,9 +519,17 @@ def _list_snapshots(cwd: Path, settings: SnapshotConfig) -> int:
 
 
 def _show_run(cwd: Path, run_id: str) -> int:
-    report = cwd / ".dai" / "runs" / run_id / "report.md"
+    directory = find_run(run_id, cwd)
+    if directory is None:
+        print(f"dai: no run {run_id}", file=sys.stderr)
+        return EXIT_ERROR
+    report = directory / "report.md"
     if not report.is_file():
-        print(f"dai: no report for run {run_id}", file=sys.stderr)
+        print(
+            f"dai: run {run_id} has no report — it never finished; "
+            f"its log is {directory / 'events.jsonl'}",
+            file=sys.stderr,
+        )
         return EXIT_ERROR
     print(report.read_text(encoding="utf-8"))
     return EXIT_OK

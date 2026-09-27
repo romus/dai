@@ -113,6 +113,47 @@ def test_claude_passes_schema_inline():
     assert argv[argv.index("--json-schema") + 1] == '{"type": "object"}'
 
 
+def claude_argv(engine: ClaudeEngine) -> list[str]:
+    return engine.build_argv(
+        "t", access=Access.READ_ONLY, schema=None, schema_path=None, session=Session()
+    )
+
+
+def test_claude_may_read_the_run_s_screenshots_once_there_are_some(tmp_path):
+    """They live under ~/.dai, outside the workdir claude is confined to."""
+
+    images = tmp_path / "images"
+    engine = ClaudeEngine(read_dirs=[images])
+
+    # None pasted yet: the argv is what it always was.
+    assert "--add-dir" not in claude_argv(engine)
+
+    images.mkdir()
+    assert "--add-dir" in claude_argv(engine), "a picture pasted mid-run is picked up"
+
+
+def test_claude_s_add_dir_comes_last_so_nothing_after_it_is_swallowed(tmp_path):
+    """--add-dir is variadic, and so is a --disallowed-tools the config may end on."""
+
+    engine = ClaudeEngine(
+        extra_args=["--disallowed-tools", "Edit", "Write"], read_dirs=[tmp_path]
+    )
+
+    argv = claude_argv(engine)
+
+    assert argv[-2:] == ["--add-dir", str(tmp_path)]
+    assert argv[-5:-2] == ["--disallowed-tools", "Edit", "Write"]
+
+
+def test_codex_reads_anywhere_already_and_ignores_read_dirs(tmp_path):
+    def argv(engine):
+        return engine.build_argv(
+            "t", access=Access.READ_ONLY, schema=None, schema_path=None, session=Session()
+        )
+
+    assert argv(CodexEngine(read_dirs=[tmp_path])) == argv(CodexEngine())
+
+
 # --- codex ----------------------------------------------------------------
 
 

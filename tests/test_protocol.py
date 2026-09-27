@@ -339,7 +339,11 @@ def test_blank_language_falls_back_to_auto():
 
 
 def test_an_image_in_the_task_is_pointed_out_to_both_sides():
-    task = "match the header to .dai/runs/run-1/images/img1.png"
+    # Where a pasted screenshot actually lands: absolute, under ~/.dai.
+    task = (
+        "match the header to "
+        "/Users/me/.dai/projects/Users-me-proj-1a2b3c4d/runs/run-1/images/img1.png"
+    )
 
     for prompt in (solve_prompt(task), critique_first_prompt(task, SolverTurn())):
         assert "attachment the human added on purpose" in prompt
