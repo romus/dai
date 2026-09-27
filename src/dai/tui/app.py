@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from rich.table import Table
@@ -18,7 +18,13 @@ from textual.worker import Worker, WorkerCancelled, WorkerFailed
 
 from dai.config import Merge
 from dai.models import AgentEvent, Outcome, Role
-from dai.orchestrator import Debate, DebateEvent, DebateResult
+from dai.orchestrator import (
+    Debate,
+    DebateEvent,
+    DebateResult,
+    Objection,
+    ObjectionRecap,
+)
 from dai.snapshot import MergeCandidate, Snapshotter, describe, merge_promise
 from dai.transcript import Transcript
 from dai.tui import theme
@@ -32,6 +38,7 @@ from dai.tui.widgets import (
     IssueCase,
     IssueRow,
     RepoRow,
+    RulingBanner,
     StatusBar,
     VerdictLog,
 )
@@ -408,12 +415,184 @@ class _RowList(VerticalScroll, can_focus=False, inherit_bindings=False):
     """
 
 
-class MergeScreen(ModalScreen[tuple[Path, ...]]):
+class ObjectionScreen(ModalScreen[str]):
+    """What has to change before the agreed work goes home.
+
+    Opened from the merge screen, which hides its own card meanwhile, so the
+    two read as one dialog changing its mind rather than one stacked on the
+    other. Answers with the note as the agents will read it — `[ImgN]` already
+    swapped for its path — or with nothing, meaning back to the merge.
+    """
+
+    BINDINGS = [Binding("escape", "back", "back to merge")]
+
+    #: Measured with the note box at its cap: everything fits from 40 rows, the
+    #: prose folds away below that, and below 26 so does the tally — the
+    #: question, the box and the way to answer it are what must survive.
+    VERTICAL_BREAKPOINTS = [(0, "-tiny"), (26, "-short"), (40, "-tall")]
+
+    def __init__(
+        self,
+        candidates: Sequence[MergeCandidate],
+        *,
+        rounds_done: int,
+        cwd: Path,
+        debounce_ms: int = DEFAULT_DEBOUNCE_MS,
+        attachments: Attachments | None = None,
+    ) -> None:
+        super().__init__()
+        self.candidates = tuple(candidates)
+        self.rounds_done = rounds_done
+        self.cwd = cwd
+        self.debounce_ms = debounce_ms
+        self.attachments = attachments
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="objection-card"):
+            yield Cell(self._paint_head, id="objection-head")
+            yield Cell(self._paint_title, id="objection-title")
+            yield Cell(self._paint_lede, id="objection-lede")
+            yield Cell(self._paint_held, id="objection-held")
+            yield Cell(self._paint_label, id="objection-label")
+            yield CompletingInput(
+                cwd=self.cwd,
+                debounce_ms=self.debounce_ms,
+                placeholder="e.g. the status column must say how many results "
+                "@… found",
+                attachments=self.attachments,
+                id="objection-note",
+            )
+            yield Cell(self._paint_steps, id="objection-steps")
+            with Horizontal(id="objection-actions"):
+                yield Button(
+                    "↵  Run extra round", variant="primary", id="objection-go"
+                )
+                yield Cell(self._paint_point, id="objection-point")
+                yield Cell(self._paint_back, id="objection-back")
+            yield Cell(self._paint_footnote, id="objection-footnote")
+
+    def on_mount(self) -> None:
+        # The note box keeps focus. A focused Button answers `enter` itself,
+        # and here enter already means "send" — from inside the box.
+        button = self.query_one("#objection-go", Button)
+        button.can_focus = False
+        button.disabled = True
+
+    def repaint(self) -> None:
+        for cell in self.query(Cell):
+            cell.refresh()
+
+    # --- what it says -----------------------------------------------------
+
+    def _paint_head(self) -> Text:
+        colour = theme.color("warning")
+        line = Text()
+        line.append("● ", style=colour)
+        line.append(spaced("YOUR OBJECTION"), style=f"bold {colour}")
+        return line
+
+    def _paint_title(self) -> Text:
+        return Text("What should they fix before merge?", style=theme.style("strong"))
+
+    def _paint_lede(self) -> Text:
+        done = self.rounds_done
+        return Text(
+            f"One extra round. It runs on top of the {done} "
+            f"round{'s' if done != 1 else ''} already done and does not use the "
+            "round limit.",
+            style=theme.S_MUTED,
+        )
+
+    def _paint_held(self) -> Table:
+        added = sum(row.added for row in self.candidates)
+        removed = sum(row.removed for row in self.candidates)
+        count = len(self.candidates)
+        tally = f"{count} repo{'s' if count != 1 else ''} · +{added} -{removed}"
+        row = Table.grid(expand=True)
+        row.add_column(no_wrap=True)
+        row.add_column(justify="right", ratio=1, no_wrap=True)
+        row.add_row(
+            Text(tally, style=theme.S_MUTED),
+            Text("held, not merged", style=theme.S_MUTED),
+        )
+        return row
+
+    def _paint_label(self) -> Text:
+        colour = theme.color("warning")
+        line = Text()
+        line.append("● ", style=colour)
+        line.append(spaced("WHAT IS WRONG"), style=colour)
+        return line
+
+    def _paint_steps(self) -> Table:
+        grid = Table.grid(padding=(0, 2, 0, 0))
+        grid.add_column(width=6, justify="right", no_wrap=True)
+        grid.add_column(ratio=1)
+        for who, what in (
+            ("solver", "continues on this branch with your note as a ruling"),
+            ("critic", "checks the result against your note"),
+            ("then", "back to this merge screen, if they agree"),
+        ):
+            grid.add_row(Text(who, style=theme.S_MUTED), Text(what, style=theme.S_TEXT))
+        return grid
+
+    def _paint_point(self) -> Text:
+        line = Text()
+        line.append("@ ", style=theme.S_MUTED)
+        line.append("Point at a file", style=theme.S_MUTED)
+        return line
+
+    def _paint_back(self) -> Text:
+        line = Text()
+        line.append("esc ", style=theme.S_MUTED)
+        line.append("Back to merge", style=theme.style("strong"))
+        return line
+
+    def _paint_footnote(self) -> Text:
+        done = self.rounds_done
+        span = "round 1" if done == 1 else f"rounds 1–{done}"
+        return Text(
+            f"Solver and critic keep everything from {span}. Only your note is new.",
+            style=theme.S_MUTED,
+        )
+
+    # --- what it does -----------------------------------------------------
+
+    def on_completing_input_changed(self, event: CompletingInput.Changed) -> None:
+        self.query_one("#objection-go", Button).disabled = not event.value.strip()
+
+    def on_completing_input_submitted(self, event: CompletingInput.Submitted) -> None:
+        event.stop()
+        # An empty objection objects to nothing; enter stays inert rather than
+        # buying a round that has no instruction in it.
+        if event.value.strip():
+            self.dismiss(event.prompt.strip())
+
+    def on_completing_input_cancelled(self, event: CompletingInput.Cancelled) -> None:
+        event.stop()
+        self.dismiss("")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        note = self.query_one(CompletingInput)
+        if note.value.strip():
+            self.dismiss(note.prompt.strip())
+
+    def action_back(self) -> None:
+        self.dismiss("")
+
+
+class MergeScreen(ModalScreen[tuple[Path, ...] | Objection]):
     """At the end of an agreed run: which repositories go home.
 
     Does no git. It is handed rows worked out before it opened and hands back
     the paths that were ticked, which is what makes "nothing is written until
     you choose" a fact about the code rather than a line in a footer.
+
+    Or hands back an `Objection`: the person read what the two agreed and wants
+    something changed first. That half is offered only when the caller passes
+    `object_with`, the screen that asks what — without it this is the plain
+    merge question it always was.
     """
 
     #: Nothing here is focusable, on purpose — see BINDINGS.
@@ -421,6 +600,13 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
 
     #: Rows shown before the list starts scrolling, when there is room for them.
     MAX_ROWS = 18
+
+    #: The screen width from which Object gets a button of its own. Measured,
+    #: not derived: Merge and Toggle take 50 columns with their gaps, Object
+    #: 20, and the spacer between never gives up its last column — 71 inside
+    #: the card, which a 97-column screen is the first to leave. Below it `o`
+    #: still works, and says so on a line of its own.
+    ROOMY = 97
 
     #: A short terminal drops the two lines that are prose rather than substance,
     #: and a narrow one drops the hint before it crushes the controls.
@@ -432,6 +618,7 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         Binding("down,j", "cursor(1)", "down", show=False),
         Binding("space", "toggle", "toggle"),
         Binding("enter", "merge", "merge"),
+        Binding("o", "object", "object"),
         # `q` is named here so that it is *consumed*. The app's own q is a kill
         # switch, and the thing it would kill is the worker awaiting this very
         # screen. A modal truncates the binding chain, so this is belt and
@@ -445,11 +632,20 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         *,
         run_branch: str,
         outcome: str = "AGREED",
+        object_with: Callable[[], ModalScreen[str]] | None = None,
+        recap: ObjectionRecap | None = None,
+        blocked: str = "",
     ) -> None:
         super().__init__()
         self.candidates = tuple(candidates)
         self.run_branch = run_branch
         self.outcome = outcome
+        #: Builds the screen that asks what to object to; None offers no Object.
+        self.object_with = object_with
+        #: How the last objection went, when this is the question asked again.
+        self.recap = recap
+        #: Why an extra round cannot be afforded, if it cannot.
+        self.blocked = blocked
         # Everything that can go starts ticked: asking must default to the
         # answer `merge = true` would have given, so enter is one keystroke.
         self._selected = {row.repo for row in self.candidates if row.mergeable}
@@ -462,6 +658,8 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
             yield Cell(self._paint_outcome, id="merge-outcome")
             yield Cell(self._paint_title, id="merge-title")
             yield Cell(self._paint_lede, id="merge-lede")
+            if self.recap is not None:
+                yield Cell(self._paint_recap, id="merge-recap")
             yield Cell(self._paint_from, id="merge-from")
             with _RowList(id="merge-rows"):
                 for index, candidate in enumerate(self.candidates):
@@ -475,7 +673,17 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
                 # be pressable. It acts on the row under the cursor, which is
                 # the only row a click on it could unambiguously mean.
                 yield Button("space  Toggle", id="merge-toggle")
-                yield Cell(self._paint_keep, id="merge-keep")
+                # The way out is not a control, so it is not in this row: it
+                # sits in the footnote, and this gap is all that is left here.
+                yield Static(id="merge-spacer")
+                if self.object_with is not None:
+                    # Deliberately unlike the pair on the left: those two act on
+                    # this dialog, this one sends the agents back to work.
+                    yield Button(
+                        self._object_label(), id="merge-object", classes="-object"
+                    )
+            if self.object_with is not None:
+                yield Cell(self._paint_object_hint, id="merge-object-hint")
             yield Cell(self._paint_footnote, id="merge-footnote")
 
     def on_mount(self) -> None:
@@ -484,6 +692,9 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         # next `enter` pressing Toggle again instead of merging.
         for button in self.query(Button):
             button.can_focus = False
+        if self.blocked:
+            for button in self.query("#merge-object").results(Button):
+                button.disabled = True
         self._sync()
         # The first fit has to wait for the children to have a real size.
         self.call_after_refresh(self._fit)
@@ -507,6 +718,7 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         start quietly cutting the answer off again.
         """
 
+        self._place_object()
         card = self.query_one("#merge-card", Vertical)
         listing = self.query_one("#merge-rows", _RowList)
         # `outer_size` counts border and padding but not margin, and three of
@@ -515,11 +727,29 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         chrome = sum(
             child.outer_size.height + child.styles.margin.height
             for child in card.children
-            if child is not listing
+            if child is not listing and child.display
         )
         # The 90% and the border-plus-padding mirror `MergeScreen > Vertical`.
         budget = (self.size.height * 9) // 10 - 4 - chrome
         listing.styles.max_height = max(2, min(self.MAX_ROWS, budget))
+
+    def _place_object(self) -> None:
+        """A button where there is room for one, a line where there is not.
+
+        Decided against the width rather than by a breakpoint class, because
+        the hint also has to show whenever Object is refused, at any width —
+        the reason is the one thing a disabled button cannot say.
+        """
+
+        # Its line break depends on the width it was just given.
+        self.query_one("#merge-footnote", Cell).refresh(layout=True)
+        if self.object_with is None:
+            return
+        roomy = self.size.width >= self.ROOMY
+        self.query_one("#merge-object", Button).display = roomy
+        self.query_one("#merge-object-hint", Cell).display = (
+            not roomy or bool(self.blocked)
+        )
 
     def repaint(self) -> None:
         """Draw every line again, in whichever palette is active now.
@@ -583,17 +813,74 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
             f"same name in all {len(self.candidates)}"
         )
 
-    def _paint_keep(self) -> Text:
+    def _paint_recap(self) -> Table:
+        """How the objection that brought you back here went."""
+
+        recap = self.recap
+        assert recap is not None
+        verdict, style = {
+            "addressed": ("critic: addressed ✓", "success"),
+            "open": ("critic: still open", "warning"),
+            "dismissed": ("you dismissed it", "muted"),
+        }.get(recap.status, ("", "muted"))
+        grid = Table.grid(expand=True)
+        grid.add_column(no_wrap=True)
+        grid.add_column(justify="right", ratio=1, no_wrap=True)
+        grid.add_row(
+            Text(spaced("EXTRA ROUND · YOUR NOTE"), style=theme.WARNING),
+            Text(verdict, style=theme.style(style)),
+        )
+        grid.add_row(Text(recap.answer or recap.note, style=theme.S_MUTED), "")
+        return grid
+
+    def _paint_object_hint(self) -> Text:
         line = Text()
-        line.append("esc ", style=theme.S_MUTED)
-        line.append("Keep the branches", style=theme.style("strong"))
+        if self.blocked:
+            line.append("o ", style=theme.S_MUTED)
+            line.append(f"Object is not available — {self.blocked}", style=theme.S_MUTED)
+            return line
+        line.append("o ", style=theme.WARNING)
+        line.append(
+            "Object again" if self.recap is not None else "Object",
+            style=theme.style("plain-warning"),
+        )
+        line.append(" — send them back for one more round", style=theme.S_MUTED)
         return line
 
-    def _paint_footnote(self) -> Text:
-        return Text(
-            "Nothing is written until you choose. Every branch stays either way.",
-            style=theme.S_MUTED,
+    def _object_label(self) -> str:
+        return "o  Object again" if self.recap is not None else "o  Object"
+
+    def _paint_footnote(self) -> Table:
+        """The promise on the left, the way out on the right.
+
+        `esc` lives down here rather than among the buttons: between two
+        controls and a third, a line of text read as a fourth that could not
+        be pressed. It is the same promise, said as a key.
+        """
+
+        keep = Text()
+        keep.append("esc ", style=theme.S_MUTED)
+        keep.append("Keep branches", style=theme.style("strong"))
+        promise = (
+            "Nothing is written until you choose.",
+            "Every branch stays either way.",
         )
+        # One line where both halves fit beside the key; otherwise broken
+        # between the sentences, rather than wherever the width runs out —
+        # which leaves "way." alone on a line of its own.
+        width = self.query_one("#merge-footnote", Cell).size.width
+        together = sum(map(len, promise)) + 1 + 2 + keep.cell_len
+        grid = Table.grid(expand=True, padding=(0, 0, 0, 2))
+        grid.add_column(ratio=1)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row(
+            Text(
+                " ".join(promise) if not width or width >= together else "\n".join(promise),
+                style=theme.S_MUTED,
+            ),
+            keep,
+        )
+        return grid
 
     def _merge_label(self) -> str:
         return f"↵  Merge {len(self._selected)} selected"
@@ -632,6 +919,23 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
     def action_keep(self) -> None:
         self.dismiss(())
 
+    def action_object(self) -> None:
+        if self.object_with is None or self.blocked:
+            return
+        # Hidden rather than covered: the question below is changing its mind,
+        # and a second card stacked on the first would say it had not.
+        self.query_one("#merge-card", Vertical).display = False
+        self.app.push_screen(self.object_with(), self._objected)
+
+    def _objected(self, note: str | None) -> None:
+        if note:
+            self.dismiss(Objection(note))
+            return
+        # Back to the merge, exactly as it was: the ticks and the cursor are
+        # the screen's own state, and nothing here touched them.
+        self.query_one("#merge-card", Vertical).display = True
+        self.call_after_refresh(self._fit)
+
     def _sync(self) -> None:
         """Push the screen's two facts — cursor and ticks — onto the widgets."""
 
@@ -652,6 +956,8 @@ class MergeScreen(ModalScreen[tuple[Path, ...]]):
         event.stop()
         if event.button.id == "merge-toggle":
             self.action_toggle()
+        elif event.button.id == "merge-object":
+            self.action_object()
         else:
             self.action_merge()
 
@@ -808,6 +1114,9 @@ class DaiApp(FollowsTerminal, App):
 
     def compose(self) -> ComposeResult:
         yield StatusBar(id="status")
+        # In the flow, not docked: the status bar already holds the top edge,
+        # and a second widget docked there would sit on top of it.
+        yield RulingBanner(id="ruling")
         with Horizontal(id="panes"):
             yield AgentPane(
                 "SOLVER",
@@ -874,14 +1183,26 @@ class DaiApp(FollowsTerminal, App):
             self.query_one(VerdictLog).note(f"dai failed: {exc}", style="error")
             return
 
-        if self.snapshotter.active:
-            report = await asyncio.to_thread(
-                self.snapshotter.capture_final,
-                f"{self.result.outcome.value}: {self.result.reason}",
-            )
-            self.transcript.snapshots(report)
-            if self.result.agreed and self.snapshotter.settings.merge is not Merge.NEVER:
-                await self._settle_merge()
+        # Round again for as long as the person objects to what was agreed.
+        # Each pass commits what the run stands on, and only an agreement is
+        # ever asked about merging — so only an agreement can be objected to.
+        while True:
+            if self.snapshotter.active:
+                report = await asyncio.to_thread(
+                    self.snapshotter.capture_final,
+                    f"{self.result.outcome.value}: {self.result.reason}",
+                )
+                self.transcript.snapshots(report)
+            note = None
+            if (
+                self.snapshotter.active
+                and self.result.agreed
+                and self.snapshotter.settings.merge is not Merge.NEVER
+            ):
+                note = await self._settle_merge()
+            if not note:
+                break
+            await self._overrule(note)
 
         path = self.transcript.finish(
             self.result,
@@ -931,10 +1252,21 @@ class DaiApp(FollowsTerminal, App):
         status = self.query_one(StatusBar)
 
         if event.kind == "turn_start":
-            status.set_round(event.round)
-            status.set_phase(_PHASE.get(event.role, "working"))
+            extra = self.debate.is_extra(event.round)
+            status.set_round(
+                self.debate.counted_round(event.round),
+                extra=self.debate.budget.extra_rounds,
+            )
+            status.set_phase(
+                "extra round" if extra else _PHASE.get(event.role, "working")
+            )
             pane = self._pane_for(event.role)
-            pane.rule(f"round {event.round}")
+            if not extra:
+                pane.rule(f"round {event.round}")
+            elif event.role is Role.CRITIQUE:
+                pane.rule("extra round · checking your note")
+            else:
+                pane.rule("extra round · with you")
             pane.set_activity(_ACTIVITY.get(event.role, "working"))
             self._active_role = event.role
             self._focus_pane(event.role)
@@ -997,32 +1329,56 @@ class DaiApp(FollowsTerminal, App):
         )
         return ruling
 
-    async def _settle_merge(self) -> None:
+    async def _settle_merge(self) -> str | None:
         """Decide what goes home, and move it. Only ever reached on agreement.
 
         Sits between the final commit and the transcript on purpose: after the
         commit, so the rows it shows are the real ones; before the record, so
         the report can state what actually happened rather than what the config
         intended.
+
+        Returns the note, when the answer was an objection rather than a merge:
+        nothing has been merged then, and the caller owes the agents a round.
         """
 
         if self.snapshotter.settings.merge is Merge.ALWAYS:
             await asyncio.to_thread(self.snapshotter.merge)
-            return
+            return None
 
         rows = await asyncio.to_thread(self.snapshotter.preview)
         if not rows:
-            return
+            return None
 
         self.query_one(StatusBar).set_phase("waiting for you")
         assert self.result is not None
         label, _ = _OUTCOME_STYLE[self.result.outcome]
-        # `or ()` for the same reason `_on_deadlock` has its fallback: a screen
-        # dismissed by anything other than its own two exits answers nothing,
-        # and nothing must read as "keep the branches", never as consent.
-        chosen = await self.push_screen_wait(
-            MergeScreen(rows, run_branch=self.snapshotter.branch, outcome=label)
-        ) or ()
+        screen = MergeScreen(
+            rows,
+            run_branch=self.snapshotter.branch,
+            outcome=label,
+            object_with=lambda: ObjectionScreen(
+                rows,
+                rounds_done=len(self.debate.rounds),
+                cwd=self.cwd,
+                debounce_ms=self.debounce_ms,
+                attachments=self._attachments(),
+            ),
+            recap=self.debate.objection_recap(),
+            blocked=self.debate.objection_blocked() or "",
+        )
+        # Nobody is spending anything while a person reads the diff, so the
+        # wall clock waits with them.
+        self.debate.budget.hold()
+        try:
+            # `or ()` for the same reason `_on_deadlock` has its fallback: a
+            # screen dismissed by anything other than its own exits answers
+            # nothing, and nothing must read as "keep the branches", never as
+            # consent.
+            chosen = await self.push_screen_wait(screen) or ()
+        finally:
+            self.debate.budget.release()
+        if isinstance(chosen, Objection):
+            return chosen.note
         self.query_one(VerdictLog).note(
             f"you chose: merge {len(chosen)} of {len(rows)}"
             if chosen
@@ -1032,6 +1388,41 @@ class DaiApp(FollowsTerminal, App):
         await asyncio.to_thread(
             self.snapshotter.merge, only=chosen, kept="you kept the branch"
         )
+        return None
+
+    async def _overrule(self, note: str) -> None:
+        """Send the agents back for the extra round a person asked for."""
+
+        # The run is live again. `result` is what every control checks to know
+        # the argument is over, and the kill switch is what falls back on
+        # `abort_result` when it finds none.
+        self.result = None
+        if self._paused:
+            # A pause pressed during the last critique outlived the agreement;
+            # left on, the extra round would wait at its gate for ever.
+            self._paused = False
+            self.debate.resume()
+
+        verdicts = self.query_one(VerdictLog)
+        verdicts.note(note, style="plain-warning", label="YOU")
+        rounds = self.debate.rounds
+        self.query_one(RulingBanner).show(
+            note, self.debate.counted_round(len(rounds))
+        )
+        self.query_one(StatusBar).set_phase("extra round")
+        self.query_one("#critic", AgentPane).set_activity(
+            "will check the result against your note", pulse=False
+        )
+        if self.snapshotter.active:
+            self.snapshotter.mark()
+
+        try:
+            self.result = await self.debate.overrule(note)
+        except Exception as exc:  # the same promise `run_debate` makes
+            verdicts.note(f"the extra round failed: {exc}", style="error")
+            self.result = self.debate.abort_result(f"the extra round failed: {exc}")
+        finally:
+            self.query_one(RulingBanner).hide()
 
     # --- actions ----------------------------------------------------------
 
@@ -1112,7 +1503,7 @@ class DaiApp(FollowsTerminal, App):
             )
         else:
             self.debate.resume()
-            self.query_one(StatusBar).set_phase(_PHASE.get(self._active_role, "working"))
+            self.query_one(StatusBar).set_phase(self._phase())
             self.query_one(VerdictLog).note("resumed")
         if self._active_role is not None:
             self._pane_for(self._active_role).set_activity(
@@ -1169,12 +1560,21 @@ class DaiApp(FollowsTerminal, App):
         """
 
         self.query_one(StatusBar).repaint()
+        self.query_one(RulingBanner).refresh()
         for pane in self.query(AgentPane):
             pane.repaint()
         self.query_one(VerdictLog).repaint()
         for screen in self.screen_stack:
             if (repaint := getattr(screen, "repaint", None)) is not None:
                 repaint()
+
+    def _phase(self) -> str:
+        """What the pill says for whoever holds the turn now."""
+
+        rounds = self.debate.rounds
+        if rounds and self.debate.is_extra(rounds[-1].number):
+            return "extra round"
+        return _PHASE.get(self._active_role, "working")
 
     def _pane_for(self, role: Role | None) -> AgentPane:
         target = "critic" if role is Role.CRITIQUE else "solver"

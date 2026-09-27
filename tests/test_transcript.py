@@ -170,6 +170,30 @@ def test_report_records_the_argument_not_just_the_outcome():
     assert "Checked:" in body                 # what it verified
 
 
+def test_report_says_which_round_a_person_asked_for_and_why():
+    result = sample_result()
+    result.rounds.append(
+        Round(
+            number=3,
+            objection="status must say how many results\nand the hint text too",
+            solver=SolverTurn(
+                summary="applied your note",
+                replies=[Reply(id="you", action=Action.FIXED, detail="matrix.md:7")],
+            ),
+            critic=CriticTurn(verdict=Verdict.APPROVE, checked=["re-read matrix.md"]),
+        )
+    )
+
+    body = render_report(result, run_id="r", task="t", cwd=Path("/tmp"),
+                         solver="claude", critic="codex")
+
+    assert "## Round 3 — extra round, after your objection" in body
+    assert "### Your objection" in body
+    assert "> status must say how many results\n> and the hint text too" in body
+    assert "| you | FIXED | matrix.md:7 |" in body
+    assert "## Round 2\n" in body  # an ordinary round is headed as it always was
+
+
 def test_report_escapes_pipes_so_the_table_survives():
     body = render_report(sample_result(), run_id="r", task="t", cwd=Path("/tmp"),
                          solver="claude", critic="codex")

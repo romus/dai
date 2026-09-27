@@ -156,6 +156,16 @@ written until you answer, and every branch survives whichever way you answer. Pi
 redirected, with nobody to ask, nothing is merged and the report says so. `merge = true`
 skips the question, `merge = false` never merges at all.
 
+Or you can object. If the two agreed on something you will not take, press `o` in the
+dialog (`o` at the `[y/N/o]` question in a plain terminal) and write what has to change
+— `@` points at a file, `ctrl+v` pastes a screenshot. That buys one extra round,
+played on top of the round limit rather than out of it: the solver applies your note
+as a ruling it may not reject, the critic checks the result against it and may neither
+concede nor downgrade it, and the question comes back — saying what your note changed
+in each repository — only if they agree again. If they do not, the argument simply
+carries on as any other would. Money and time limits still apply; time spent reading
+the dialog does not count against them.
+
 A repository whose base branch moved while the agents were working is refused whatever
 you say — the reason names the file that landed there — and stays on `dai/<run-id>`,
 yours to merge by hand.

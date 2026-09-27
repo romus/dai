@@ -9,7 +9,7 @@ import pytest
 from dai.budget import Budget, Limits
 from dai.consensus import Referee
 from dai.engines.base import Engine
-from dai.models import Outcome, Role, TurnResult, Usage
+from dai.models import Issue, Outcome, Role, Severity, TurnResult, Usage
 from dai.orchestrator import Debate
 
 
@@ -497,3 +497,161 @@ async def test_events_narrate_the_argument(tmp_path):
     assert kinds[-1] == "finished"
     roles = [e.role for e in events if e.kind == "turn_start"]
     assert roles == [Role.SOLVE, Role.CRITIQUE]
+
+
+# --- objecting to an agreement ------------------------------------------------
+
+NOTE = "the status column must show how many results search found"
+
+
+def answered(detail="status now reads '3 results'", action="FIXED"):
+    return solved(responses=[{"id": "you", "action": action, "detail": detail}])
+
+
+def refiling(severity="blocker", *, verdict="REQUEST_CHANGES", conceded=()):
+    """The critic keeps the note open, word for word."""
+
+    return {
+        "verdict": verdict,
+        "checked": ["read a.md"],
+        "issues": [
+            {"id": "you", "severity": severity, "claim": NOTE,
+             "evidence": "a.md:3 still blank", "fix": "do it"}
+        ],
+        "conceded": list(conceded),
+        "summary": "not done",
+    }
+
+
+async def test_an_objection_buys_one_extra_round_and_can_agree_again(tmp_path):
+    d, solver, critic = debate(
+        tmp_path, [solved(), answered()], [approve(), approve()]
+    )
+    events = []
+    d.on_event = events.append
+
+    first = await d.run()
+    assert first.agreed
+
+    result = await d.overrule(NOTE)
+
+    assert result.outcome is Outcome.CONSENSUS, result.reason
+    assert len(result.rounds) == 2
+    assert result.rounds[-1].objection == NOTE
+    assert d.budget.extra_rounds == 1
+    assert [e.text for e in events if e.kind == "objection"] == [NOTE]
+
+    # The solver was told this is a person's ruling, binding, and unrebuttable.
+    assert NOTE in solver.prompts[1]
+    assert "`REJECTED` is not available" in solver.prompts[1]
+    assert "Everything else you agreed stays settled" in solver.prompts[1]
+    # And the critic that it may only verify it — with the solver's answer.
+    assert "not yours to concede or to downgrade" in critic.prompts[1]
+    assert "[you] FIXED: status now reads '3 results'" in critic.prompts[1]
+
+    recap = d.objection_recap()
+    assert recap is not None
+    assert recap.status == "addressed"
+    assert recap.answer == "status now reads '3 results'"
+
+
+async def test_an_extra_round_leaves_the_ordinary_rounds_where_they_were(tmp_path):
+    """Agreed in round 1 of 2, objected, not settled: round 2 is still there."""
+
+    d, solver, critic = debate(
+        tmp_path,
+        [solved(), answered(action="PARTIAL"), answered()],
+        [approve(), refiling(), approve()],
+        budget=Budget(Limits(max_rounds=2, max_usd=None, max_wall_seconds=None)),
+    )
+    await d.run()
+
+    result = await d.overrule(NOTE)
+
+    assert result.outcome is Outcome.CONSENSUS, result.reason
+    assert [r.number for r in result.rounds] == [1, 2, 3]
+    assert [d.counted_round(n) for n in (1, 2, 3)] == [1, 1, 2]
+    assert d.is_extra(2) and not d.is_extra(3)
+    # Round 3 is the last one the limit allows, and the solver is told so.
+    assert "FINAL round" in solver.prompts[2]
+
+
+async def test_an_objection_not_settled_at_the_limit_is_not_an_agreement(tmp_path):
+    d, solver, critic = debate(
+        tmp_path,
+        [solved(), answered(action="PARTIAL"), answered()],
+        [approve(), refiling()],
+        budget=Budget(Limits(max_rounds=1, max_usd=None, max_wall_seconds=None)),
+    )
+    await d.run()
+
+    result = await d.overrule(NOTE)
+
+    assert result.outcome is Outcome.ROUNDS
+    assert not result.agreed
+    # The critic's policy applied the open note in one last enforced turn.
+    assert NOTE in solver.prompts[-1]
+
+
+@pytest.mark.parametrize(
+    "critique",
+    [
+        refiling(verdict="APPROVE"),  # approving while still filing it
+        refiling(severity="minor"),  # filing it as minor, which settles
+        refiling(conceded=("you",)),  # conceding it, which drops it
+    ],
+    ids=["approve", "minor", "concede"],
+)
+async def test_the_critic_cannot_wave_the_note_through(tmp_path, critique):
+    d, solver, critic = debate(
+        tmp_path,
+        [solved(), answered(), answered()],
+        [approve(), critique, approve()],
+    )
+    await d.run()
+
+    result = await d.overrule(NOTE)
+
+    held = result.rounds[1].critic
+    assert held.verdict.value == "REQUEST_CHANGES"
+    assert [i.severity.value for i in held.open_issues] == ["blocker"]
+    assert not result.rounds[1].assessment.settled
+    # It took another round, and the critic's clean approval, to end it.
+    assert result.outcome is Outcome.CONSENSUS
+    assert len(result.rounds) == 3
+
+
+async def test_a_note_matching_an_earlier_strike_is_not_struck(tmp_path):
+    """Your note is your own word — an old dismissal must not swallow it."""
+
+    d, solver, critic = debate(
+        tmp_path, [solved(), answered(), answered()], [approve(), refiling(), approve()]
+    )
+    await d.run()
+    struck = Issue(id="i9", severity=Severity.MAJOR, claim=NOTE)
+    d._struck[struck.fingerprint] = struck
+
+    result = await d.overrule(NOTE)
+
+    assert result.rounds[1].critic.open_issues, "the note was struck on sight"
+    assert not any("struck" in note for note in result.rounds[1].notes)
+
+
+async def test_an_objection_the_budget_cannot_afford_is_refused(tmp_path):
+    d, solver, critic = debate(
+        tmp_path,
+        [solved()],
+        [approve()],
+        budget=Budget(Limits(max_rounds=5, max_usd=0.02, max_wall_seconds=None)),
+    )
+    await d.run()  # two turns at 0.01
+
+    assert "budget exhausted" in d.objection_blocked()
+
+
+async def test_no_objection_means_no_recap(tmp_path):
+    d, solver, critic = debate(tmp_path, [solved()], [approve()])
+    await d.run()
+
+    assert d.objection_recap() is None
+    assert d.objection_blocked() is None

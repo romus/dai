@@ -49,6 +49,17 @@ StatusBar > #phase-pill {
     height: 1fr;
 }
 
+/* Your objection, over the panes while it binds. Auto-height, since the note
+   is yours and may run to a paragraph — but capped, so it never takes the
+   panes it is there to explain. */
+RulingBanner {
+    height: auto;
+    max-height: 6;
+    padding: 1 2;
+    background: $surface;
+    border-bottom: solid $dai-rule;
+}
+
 AgentPane {
     width: 1fr;
 }
@@ -516,8 +527,8 @@ RepoRow.-cursor {
    neither can be even at every terminal size, and a number can. 24 holds
    "Merge 12 selected"; anything longer is cut rather than wrapped, since a
    second line would push the row past the height it is drawn at.
-   `min-width` has to be said: Button ships 16 and the Cell beside it ships
-   none, which is what made them diverge on a narrow terminal. */
+   `min-width` has to be said: Button ships 16 and a bare widget ships none,
+   which is what made them diverge on a narrow terminal. */
 #merge-go,
 #merge-toggle {
     width: 24;
@@ -528,27 +539,18 @@ RepoRow.-cursor {
     text-overflow: ellipsis;
 }
 
-
-/* Cut, never wrapped — wrapping turns this into a three-line esc/Keep/the
-   column that drags the whole row taller. */
-#merge-keep {
+/* What is left of the row once the pair has its columns: it pushes Object to
+   the far end, where it sits apart from the two that act on this dialog. */
+#merge-spacer {
     width: 1fr;
     min-width: 0;
-    height: 3;
-    content-align: right middle;
-    text-align: right;
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
 }
 
-/* Too short for prose, or too narrow for the hint: fold away the parts that
-   are not the question, rather than crop the parts that are. */
+/* Too short for prose: fold away the parts that are not the question, rather
+   than crop the parts that are. The esc hint folds with the footnote it
+   rides in; the key itself never goes anywhere. */
 MergeScreen.-short #merge-lede,
 MergeScreen.-short #merge-footnote {
-    display: none;
-}
-
-MergeScreen.-narrow #merge-keep {
     display: none;
 }
 
@@ -566,4 +568,145 @@ MergeScreen.-narrow #merge-toggle {
     height: auto;
     margin: 1 0 0 0;
     color: $dai-muted;
+}
+
+/* What your last objection bought, when this is the question asked again. */
+#merge-recap {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    border: round $dai-rule;
+}
+
+/* Not one of the pair: those two act on this dialog, this one sends the
+   agents back to work — so it is outlined in the colour your own voice wears
+   everywhere else, and sits apart at the far end. Fixed, like the pair, so
+   "Object" and "Object again" take the same room. `MergeScreen._place_object`
+   decides whether there is room for it at all. */
+#merge-object {
+    width: 20;
+    min-width: 20;
+    max-width: 20;
+    margin: 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    background: $surface;
+    color: $warning;
+    border: round $warning;
+}
+
+#merge-object:hover {
+    background: $panel;
+}
+
+#merge-object-hint {
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+/* --- the objection ------------------------------------------------------ */
+
+/* Transparent: it opens over the merge screen, whose own dim is still there
+   beneath it — a second one would darken the run behind twice. */
+ObjectionScreen {
+    align: center middle;
+    background: transparent;
+}
+
+ObjectionScreen > Vertical {
+    width: 80%;
+    max-width: 96;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: round $warning;
+}
+
+#objection-head,
+#objection-title,
+#objection-lede,
+#objection-held,
+#objection-label,
+#objection-steps,
+#objection-footnote {
+    height: auto;
+}
+
+#objection-title,
+#objection-lede {
+    margin: 1 0 0 0;
+}
+
+#objection-held {
+    margin: 1 0 0 0;
+    border-top: solid $dai-rule;
+    border-bottom: solid $dai-rule;
+}
+
+#objection-label {
+    margin: 1 0 1 0;
+}
+
+#objection-steps {
+    margin: 1 0 0 0;
+}
+
+#objection-actions {
+    height: auto;
+    margin: 1 0 0 0;
+    border-top: solid $dai-rule;
+}
+
+#objection-go {
+    width: 24;
+    min-width: 24;
+    max-width: 24;
+    margin: 0 2 0 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#objection-point,
+#objection-back {
+    height: 3;
+    content-align: left middle;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#objection-point {
+    width: auto;
+}
+
+#objection-back {
+    width: 1fr;
+    min-width: 0;
+    content-align: right middle;
+    text-align: right;
+}
+
+#objection-footnote {
+    margin: 1 0 0 0;
+}
+
+/* Tighter than the prompt's own cap: this box shares a card with the button
+   that sends it, and a note that grew past the card would push that off. */
+#objection-note > PromptArea {
+    max-height: 6;
+}
+
+/* Too short for prose: keep the question, the box and the way out. */
+ObjectionScreen.-short #objection-lede,
+ObjectionScreen.-short #objection-steps,
+ObjectionScreen.-short #objection-footnote,
+ObjectionScreen.-tiny #objection-lede,
+ObjectionScreen.-tiny #objection-steps,
+ObjectionScreen.-tiny #objection-footnote,
+ObjectionScreen.-tiny #objection-held {
+    display: none;
+}
+
+ObjectionScreen.-tiny #objection-label {
+    margin: 1 0 0 0;
 }

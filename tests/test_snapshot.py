@@ -992,3 +992,65 @@ def test_a_run_s_bookkeeping_never_reaches_the_user_s_repo(tmp_path, dai_home):
     # even worth a commit.
     assert snap.capture("r1").taken == []
     assert (exclude.read_text() if exclude.exists() else "") == before
+
+
+# --- an objection's extra round -----------------------------------------------
+
+
+def test_the_preview_says_which_part_the_extra_round_wrote(tmp_path):
+    """"+n -m from your round": the part of the diff a person's note bought."""
+
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n", "b.txt": "b\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    assert snap.preview()[0].since is None  # nobody has objected
+
+    snap.mark()
+    (repo / "b.txt").write_text("b\nmore\n")
+    snap.capture_final()
+
+    row = snap.preview()[0]
+
+    assert (row.added, row.removed) == (2, 1)  # the whole run, as before
+    assert row.since == (1, 0)  # only what the extra round did
+
+
+def test_a_second_final_commit_after_nothing_changed_commits_nothing(tmp_path):
+    repo = make_repo(tmp_path / "proj", {"a.txt": "one\n"})
+    snap = Snapshotter(repo, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {repo / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+    tip = run("rev-parse", "dai/run1", cwd=repo)
+
+    assert snap.capture_final().taken == []
+    assert run("rev-parse", "dai/run1", cwd=repo) == tip
+
+
+def test_a_repository_first_touched_by_the_extra_round_counts_from_its_own_start(
+    tmp_path,
+):
+    """Everything in it is that round's doing — but not your work in progress."""
+
+    one = make_repo(tmp_path / "one", {"a.txt": "one\n"})
+    two = make_repo(tmp_path / "two", {"b.txt": "b\n"})
+    (two / "mine.txt").write_text("my own wip\n")
+    snap = Snapshotter(tmp_path, "run1")
+
+    snap.capture_gate(1)
+    round_of(snap, {one / "a.txt": "two\n"}, 2)
+    snap.capture_final()
+
+    snap.mark()
+    (two / "b.txt").write_text("b\nfrom your note\n")
+    snap.capture_final()
+
+    rows = {row.label: row for row in snap.preview()}
+
+    assert rows["one"].since == (0, 0)
+    assert "mine.txt" in rows["two"].files  # the merge still carries your wip
+    assert rows["two"].since == (1, 0)  # but your round did not write it

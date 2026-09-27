@@ -50,6 +50,10 @@ class FakeEngine(Engine):
         super().__init__(cmd=sys.executable, **kwargs)
         self.solves: list[dict] = []
         self.critiques: list[dict] = []
+        #: Played whenever the script above has run out — which in the demo is
+        #: only ever an extra round you asked for, as many times as you ask.
+        self.encore_solve: dict | None = None
+        self.encore_critique: dict | None = None
         self.beat = BEAT
         self._turn = 0
 
@@ -81,7 +85,8 @@ class FakeEngine(Engine):
         self._turn += 1
         critiquing = self._is_critic_schema(schema)
         script = self.critiques if critiquing else self.solves
-        payload = script.pop(0) if script else None
+        encore = self.encore_critique if critiquing else self.encore_solve
+        payload = script.pop(0) if script else encore
 
         await self._perform(critiquing, cwd, access, on_event)
 

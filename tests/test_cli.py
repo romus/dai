@@ -8,9 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from dai.__main__ import _ask_merge, _settle_merge
+from dai.__main__ import _ask_merge, _run_headless, _settle_merge
+from dai.budget import Budget, Limits
 from dai.config import Merge, SnapshotConfig
+from dai.orchestrator import Debate, Objection
 from dai.snapshot import Snapshotter
+from dai.transcript import Transcript
+from test_orchestrator import Scripted, approve, solved
 
 
 def run(*args: str, cwd: Path) -> str:
@@ -142,6 +146,116 @@ def test_the_question_shows_what_would_be_written(tmp_path, monkeypatch, capsys)
     assert ". → main" in shown
     assert "+1" in shown and "-1" in shown
     assert "a.txt" in shown
+
+
+# --- objecting instead of merging ----------------------------------------------
+
+NOTE = "the status column must show how many results search found"
+
+
+def answers(monkeypatch, *replies: str) -> list[str]:
+    """Feed `input()` these, in order, and keep every question it was asked."""
+
+    queue, asked = list(replies), []
+
+    def fake(prompt):
+        asked.append(prompt)
+        return queue.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake)
+    return asked
+
+
+def test_o_objects_with_a_note_instead_of_merging(tmp_path, monkeypatch):
+    snap, _ = worked_in(tmp_path)
+    at_a_terminal(monkeypatch)
+    asked = answers(monkeypatch, "o", NOTE)
+
+    chosen = _ask_merge(snap.preview(), can_object=True)
+
+    assert chosen == Objection(NOTE)
+    assert "[y/N/o]" in asked[0]
+    assert "fix" in asked[1]
+
+
+def test_an_empty_note_puts_the_question_again(tmp_path, monkeypatch):
+    """An objection with nothing in it objects to nothing."""
+
+    snap, repo = worked_in(tmp_path)
+    at_a_terminal(monkeypatch)
+    asked = answers(monkeypatch, "o", "", "y")
+
+    chosen = _ask_merge(snap.preview(), can_object=True)
+
+    assert chosen == [repo.resolve()]
+    assert len(asked) == 3
+
+
+def test_o_means_no_where_objecting_was_not_offered(tmp_path, monkeypatch):
+    snap, _ = worked_in(tmp_path)
+    at_a_terminal(monkeypatch)
+    asked = answers(monkeypatch, "o")
+
+    assert _ask_merge(snap.preview()) == []
+    assert "[y/N]" in asked[0] and "/o" not in asked[0]
+
+
+def test_an_objection_nobody_can_afford_is_not_offered(tmp_path, monkeypatch, capsys):
+    snap, _ = worked_in(tmp_path)
+    at_a_terminal(monkeypatch)
+    asked = answers(monkeypatch, "n")
+
+    _ask_merge(snap.preview(), can_object=True, blocked="budget exhausted: $5 of $5")
+
+    assert "/o" not in asked[0]
+    assert "budget exhausted" in capsys.readouterr().out
+
+
+class Writing(Scripted):
+    """A solver whose turns leave something on disk, one write per turn."""
+
+    def __init__(self, name, script, writes):
+        super().__init__(name, script)
+        self.writes = list(writes)
+
+    async def run(self, prompt, **kwargs):
+        if self.writes:
+            path, text = self.writes.pop(0)
+            path.write_text(text)
+        return await super().run(prompt, **kwargs)
+
+
+def test_a_headless_objection_runs_an_extra_round_then_asks_again(
+    tmp_path, monkeypatch, capsys
+):
+    repo = make_repo(tmp_path / "proj")
+    snap = Snapshotter(repo, "run1", SnapshotConfig(merge=Merge.ASK))
+    solver = Writing(
+        "solver",
+        [solved(), solved(responses=[
+            {"id": "you", "action": "FIXED", "detail": "status reads 3 results"}
+        ])],
+        [(repo / "a.txt", "two\n"), (repo / "a.txt", "two\nthree\n")],
+    )
+    debate = Debate(
+        task="do the thing", cwd=repo, solver=solver,
+        critic=Scripted("critic", [approve(), approve()]),
+        budget=Budget(Limits(max_rounds=5, max_usd=None, max_wall_seconds=None)),
+    )
+    at_a_terminal(monkeypatch)
+    asked = answers(monkeypatch, "o", NOTE, "y")
+
+    result = asyncio.run(_run_headless(debate, repo, Transcript(repo, "run1"), snap))
+    shown = capsys.readouterr().out
+
+    assert result.agreed
+    assert [r.objection for r in result.rounds] == ["", NOTE]
+    assert len(asked) == 3
+    assert "extra round · your note" in shown
+    assert "critic: addressed" in shown
+    assert "+1 from your round" in shown
+    assert snap.summary()[0].merged is True
+    assert (repo / "a.txt").read_text() == "two\nthree\n"
 
 
 # --- dai --clean, --runs, --show ------------------------------------------

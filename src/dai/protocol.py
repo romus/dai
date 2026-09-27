@@ -163,13 +163,13 @@ _IMAGE_PATH = re.compile(
 )
 
 _ATTACHMENT = (
-    "The task points at an image file. That is an attachment the human added on "
-    "purpose, not decoration — open it and look at it before you decide what the "
-    "task asks for, and treat what it shows as part of the brief."
+    "The {subject} points at an image file. That is an attachment the human added "
+    "on purpose, not decoration — open it and look at it before you decide what "
+    "the {subject} asks for, and treat what it shows as part of the brief."
 )
 
 
-def attachments_rule(task: str) -> str:
+def attachments_rule(task: str, *, subject: str = "task") -> str:
     """Tell the agent to open the picture the task points at, if it does.
 
     Conditional on the task text rather than plumbed through from the frontend:
@@ -179,7 +179,9 @@ def attachments_rule(task: str) -> str:
     is what keeps a task with no images reading exactly as it did before.
     """
 
-    return f"\n{_ATTACHMENT}\n" if _IMAGE_PATH.search(task) else ""
+    if not _IMAGE_PATH.search(task):
+        return ""
+    return f"\n{_ATTACHMENT.format(subject=subject)}\n"
 
 
 # How hard the two lean on each other. The evidence rules do not move with it — an
@@ -496,6 +498,47 @@ finds the hard way.
 {lang}
 """
 
+# The one turn that follows an *agreement*. Everything else in this file assumes
+# the two agents are the last word; here a person read what they agreed and said
+# no. The solver has to hear both halves: the note is binding, and nothing the
+# note does not touch is reopened — told only the first, it starts over.
+OBJECTED = """\
+You and the critic agreed, and the human running this session read the result and \
+objected before merging it. Their note is a ruling: it overrides what the two of you \
+settled, and your own judgement.
+
+THE HUMAN'S NOTE
+[{id}] {note}
+{attachments}
+Apply it now, on top of the work as it stands. Do not start over, and do not undo \
+anything the note does not ask you to. Answer it in `responses` under the id `{id}` \
+with `FIXED` or `PARTIAL` and an address: which file and which lines now carry it. \
+`REJECTED` is not available. Where you apply something you still believe is wrong, \
+apply it anyway and say so in `detail`; if it is genuinely impossible, say so \
+explicitly rather than silently skipping it.
+
+Everything else you agreed stays settled. The critic reviews this turn against the \
+note, so re-open every file you touched and confirm the change is there, and report \
+this round's files in `files_changed` — a file missing from it is one the critic finds \
+the hard way.
+{rigor}
+{lang}
+"""
+
+# Put in front of CRITIQUE_NEXT rather than written as a prompt of its own: the
+# critic's job this round is its ordinary one plus one fixed point, and restating
+# the ordinary one would be a second copy of the rules to keep in step.
+OBJECTION_REVIEW = """\
+After you approved, the human running this session objected before merging. Their \
+note is issue [{id}] below, and the solver has just acted on it. It is a ruling, not a \
+claim to weigh: it is not yours to concede or to downgrade, only to verify. If the \
+work on disk now does what the note asks, leave [{id}] out of `issues`. If it does not, \
+keep [{id}] in `issues` with its `claim` word for word and put what you found in \
+`evidence`. Everything below applies as usual — this round's change can break what \
+you approved before.
+
+"""
+
 
 # The referee catches an unaudited approval and then has nowhere to put the finding:
 # it used to become a note nobody reads plus a wasted write-access solver turn over
@@ -576,6 +619,39 @@ def arbitrated_prompt(
         dismissed=render_issues(dismissed) or "(none)",
         rigor=rigor_rule(rigor, critic=False),
         lang=language_rule(language),
+    )
+
+
+def objection_prompt(
+    note: Issue, *, language: str = AUTO, rigor: str = STANDARD
+) -> str:
+    """The solver's turn after a person objected to what the two agreed.
+
+    The note arrives as an `Issue` so that it is answered by id through the
+    same schema as any other complaint, and the critic can then check that
+    answer the way it checks any other.
+    """
+
+    return OBJECTED.format(
+        id=note.id,
+        note=note.claim.strip(),
+        # A screenshot pasted into the note is a path the solver has to open.
+        attachments=attachments_rule(note.claim, subject="note"),
+        rigor=rigor_rule(rigor, critic=False),
+        lang=language_rule(language),
+    )
+
+
+def objection_review_prompt(
+    round_no: int,
+    note: Issue,
+    solver: SolverTurn,
+    *,
+    language: str = AUTO,
+    rigor: str = STANDARD,
+) -> str:
+    return OBJECTION_REVIEW.format(id=note.id) + critique_next_prompt(
+        round_no, [note], solver, language=language, rigor=rigor
     )
 
 
